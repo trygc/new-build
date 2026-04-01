@@ -1,0 +1,801 @@
+:root {
+  color-scheme: light;
+  --live-bg: hsl(var(--background));
+  --live-surface: rgba(255, 255, 255, 0.86);
+  --live-surface-strong: rgba(255, 255, 255, 0.96);
+  --live-surface-muted: rgba(244, 244, 245, 0.88);
+  --live-border: rgba(24, 24, 27, 0.08);
+  --live-border-strong: rgba(24, 24, 27, 0.14);
+  --live-text: hsl(var(--foreground));
+  --live-muted: rgb(113 113 122);
+  --live-soft: rgb(82 82 91);
+  --live-shadow: 0 24px 60px rgba(15, 23, 42, 0.08);
+  --live-green: rgb(16 185 129);
+  --live-amber: rgb(245 158 11);
+  --live-red: rgb(239 68 68);
+}
+
+.dark {
+  color-scheme: dark;
+  --live-surface: rgba(24, 24, 27, 0.88);
+  --live-surface-strong: rgba(24, 24, 27, 0.96);
+  --live-surface-muted: rgba(39, 39, 42, 0.9);
+  --live-border: rgba(255, 255, 255, 0.08);
+  --live-border-strong: rgba(255, 255, 255, 0.14);
+  --live-muted: rgb(161 161 170);
+  --live-soft: rgb(212 212 216);
+  --live-shadow: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background:
+    radial-gradient(circle at top left, rgba(0, 0, 0, 0.05), transparent 24%),
+    radial-gradient(circle at bottom right, rgba(113, 113, 122, 0.09), transparent 22%),
+    var(--live-bg);
+  color: var(--live-text);
+  font-family: var(--app-font-family, Inter, "Segoe UI", system-ui, sans-serif);
+}
+
+body {
+  padding: 28px;
+}
+
+a {
+  color: inherit;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+.liveops-shell {
+  max-width: 1380px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.liveops-hero,
+.liveops-panel,
+.liveops-metric-card,
+.liveops-stage-card,
+.liveops-banner {
+  border: 1px solid var(--live-border);
+  background: var(--live-surface);
+  backdrop-filter: blur(16px);
+  box-shadow: var(--live-shadow);
+}
+
+.liveops-hero {
+  position: relative;
+  overflow: hidden;
+  border-radius: 32px;
+  padding: 30px 32px 22px;
+}
+
+.liveops-hero::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 82% 22%, rgba(255, 255, 255, 0.3), transparent 28%),
+    linear-gradient(135deg, rgba(24, 24, 27, 0.055), transparent 52%);
+  pointer-events: none;
+}
+
+.dark .liveops-hero::before {
+  background:
+    radial-gradient(circle at 82% 22%, rgba(255, 255, 255, 0.08), transparent 28%),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 52%);
+}
+
+.liveops-hero-grid,
+.liveops-hero-footer {
+  position: relative;
+  z-index: 1;
+}
+
+.liveops-hero-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(280px, 340px);
+  gap: 20px;
+  align-items: start;
+}
+
+.liveops-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  padding: 0 14px;
+  border-radius: 999px;
+  background: rgba(17, 24, 39, 0.07);
+  color: var(--live-muted);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.dark .liveops-kicker {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.liveops-kicker-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--live-green);
+  box-shadow: 0 0 0 6px rgba(16, 185, 129, 0.12);
+}
+
+.liveops-title {
+  margin: 18px 0 0;
+  max-width: 11ch;
+  font-size: clamp(40px, 5vw, 72px);
+  line-height: 0.92;
+  letter-spacing: -0.06em;
+  font-weight: 900;
+}
+
+.liveops-copy {
+  margin: 14px 0 0;
+  max-width: 700px;
+  color: var(--live-soft);
+  font-size: 14px;
+  line-height: 1.7;
+  font-weight: 600;
+}
+
+.liveops-route {
+  margin-top: 16px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--live-muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.liveops-hero-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: stretch;
+}
+
+.liveops-hero-card {
+  border-radius: 24px;
+  border: 1px solid var(--live-border);
+  background: var(--live-surface-strong);
+  padding: 18px;
+}
+
+.liveops-hero-label {
+  color: var(--live-muted);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.liveops-hero-value {
+  margin-top: 10px;
+  font-size: 30px;
+  line-height: 1;
+  letter-spacing: -0.05em;
+  font-weight: 900;
+}
+
+.liveops-hero-note {
+  margin-top: 8px;
+  color: var(--live-soft);
+  font-size: 13px;
+  line-height: 1.55;
+  font-weight: 700;
+}
+
+.liveops-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.liveops-link,
+.liveops-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 46px;
+  padding: 0 16px;
+  border-radius: 16px;
+  font-size: 13px;
+  font-weight: 900;
+  text-decoration: none;
+  transition: transform 160ms ease, border-color 160ms ease, background-color 160ms ease;
+}
+
+.liveops-link:hover,
+.liveops-button:hover,
+.liveops-roster-item:hover,
+.liveops-task:hover {
+  transform: translateY(-1px);
+}
+
+.liveops-link {
+  border: 1px solid var(--live-border-strong);
+  background: transparent;
+}
+
+.liveops-button {
+  border: 0;
+  background: #111827;
+  color: #fff;
+  cursor: pointer;
+}
+
+.dark .liveops-button {
+  background: #fafafa;
+  color: #111827;
+}
+
+.liveops-hero-footer {
+  margin-top: 20px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.liveops-hero-stat {
+  min-height: 84px;
+  border-radius: 22px;
+  border: 1px solid var(--live-border);
+  background: rgba(255, 255, 255, 0.58);
+  padding: 16px;
+}
+
+.dark .liveops-hero-stat {
+  background: rgba(24, 24, 27, 0.7);
+}
+
+.liveops-hero-stat-label {
+  color: var(--live-muted);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.liveops-hero-stat-value {
+  margin-top: 8px;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: -0.04em;
+  font-weight: 900;
+}
+
+.liveops-hero-stat-copy {
+  margin-top: 6px;
+  color: var(--live-soft);
+  font-size: 12px;
+  line-height: 1.45;
+  font-weight: 700;
+}
+
+.liveops-banner {
+  border-radius: 18px;
+  padding: 14px 16px;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.liveops-banner.is-error {
+  background: rgba(254, 242, 242, 0.92);
+  color: #991b1b;
+  border-color: rgba(239, 68, 68, 0.16);
+}
+
+.dark .liveops-banner.is-error {
+  background: rgba(127, 29, 29, 0.25);
+  color: rgb(252 165 165);
+}
+
+.liveops-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.liveops-metric-card {
+  border-radius: 26px;
+  padding: 18px;
+}
+
+.liveops-metric-label {
+  color: var(--live-muted);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.liveops-metric {
+  margin-top: 12px;
+  font-size: clamp(28px, 3.2vw, 40px);
+  line-height: 1;
+  letter-spacing: -0.05em;
+  font-weight: 900;
+}
+
+.liveops-metric.is-small {
+  font-size: 18px;
+  line-height: 1.25;
+  letter-spacing: -0.03em;
+}
+
+.liveops-metric-note {
+  margin-top: 8px;
+  color: var(--live-soft);
+  font-size: 13px;
+  line-height: 1.55;
+  font-weight: 700;
+}
+
+.liveops-users {
+  border-radius: 26px;
+  padding: 18px;
+}
+
+.liveops-users-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.liveops-inline-label {
+  color: var(--live-muted);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.liveops-inline-value {
+  color: var(--live-text);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.liveops-user-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.liveops-user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 999px;
+  background: var(--live-surface-muted);
+  color: var(--live-text);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.liveops-user-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--live-green);
+}
+
+.liveops-workspace {
+  display: grid;
+  grid-template-columns: minmax(300px, 340px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.liveops-panel,
+.liveops-stage-card {
+  border-radius: 28px;
+}
+
+.liveops-panel {
+  padding: 18px;
+}
+
+.liveops-panel-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 14px;
+}
+
+.liveops-panel-title {
+  font-size: 20px;
+  line-height: 1.05;
+  letter-spacing: -0.04em;
+  font-weight: 900;
+}
+
+.liveops-panel-copy {
+  margin-top: 4px;
+  color: var(--live-soft);
+  font-size: 13px;
+  line-height: 1.55;
+  font-weight: 700;
+}
+
+.liveops-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background: var(--live-surface-muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.liveops-roster {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.liveops-roster-item {
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--live-border);
+  background: var(--live-surface-strong);
+  border-radius: 22px;
+  padding: 14px 15px;
+  cursor: pointer;
+  transition: transform 160ms ease, border-color 160ms ease, background-color 160ms ease;
+}
+
+.liveops-roster-item.is-active {
+  background: #111827;
+  border-color: #111827;
+  color: #fff;
+}
+
+.dark .liveops-roster-item.is-active {
+  background: #fafafa;
+  border-color: #fafafa;
+  color: #111827;
+}
+
+.liveops-roster-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.liveops-roster-name {
+  font-size: 15px;
+  line-height: 1.4;
+  font-weight: 900;
+}
+
+.liveops-roster-email {
+  margin-top: 4px;
+  color: inherit;
+  opacity: 0.68;
+  font-size: 12px;
+  line-height: 1.45;
+  font-weight: 700;
+  word-break: break-word;
+}
+
+.liveops-roster-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 40px;
+  min-height: 34px;
+  padding: 0 11px;
+  border-radius: 999px;
+  background: rgba(17, 24, 39, 0.08);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.liveops-roster-item.is-active .liveops-roster-count {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.dark .liveops-roster-item.is-active .liveops-roster-count {
+  background: rgba(17, 24, 39, 0.08);
+}
+
+.liveops-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.liveops-stage-card {
+  padding: 18px;
+}
+
+.liveops-focus {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 16px;
+  align-items: start;
+}
+
+.liveops-focus-name {
+  font-size: clamp(24px, 3vw, 36px);
+  line-height: 0.98;
+  letter-spacing: -0.05em;
+  font-weight: 900;
+  margin: 0;
+}
+
+.liveops-focus-email {
+  margin-top: 10px;
+  color: var(--live-muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.liveops-focus-copy {
+  margin-top: 14px;
+  color: var(--live-soft);
+  font-size: 14px;
+  line-height: 1.7;
+  font-weight: 600;
+  max-width: 680px;
+}
+
+.liveops-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.liveops-status-box {
+  border: 1px solid var(--live-border);
+  background: var(--live-surface-muted);
+  border-radius: 20px;
+  padding: 14px;
+}
+
+.liveops-status-box.is-blocked {
+  border-color: rgba(239, 68, 68, 0.18);
+}
+
+.liveops-status-box.is-progress {
+  border-color: rgba(245, 158, 11, 0.18);
+}
+
+.liveops-status-box.is-done {
+  border-color: rgba(16, 185, 129, 0.18);
+}
+
+.liveops-status-label {
+  color: var(--live-muted);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.liveops-status-value {
+  margin-top: 8px;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: -0.04em;
+  font-weight: 900;
+}
+
+.liveops-status-copy {
+  margin-top: 6px;
+  color: var(--live-soft);
+  font-size: 12px;
+  line-height: 1.45;
+  font-weight: 700;
+}
+
+.liveops-tasklist-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.liveops-tasklist {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.liveops-task {
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--live-border);
+  background: var(--live-surface-strong);
+  border-radius: 22px;
+  padding: 16px;
+  cursor: pointer;
+  transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.liveops-task.is-open {
+  border-color: var(--live-border-strong);
+}
+
+.liveops-task-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: start;
+}
+
+.liveops-task-title {
+  font-size: 16px;
+  line-height: 1.45;
+  font-weight: 900;
+}
+
+.liveops-task-context {
+  margin-top: 5px;
+  color: var(--live-muted);
+  font-size: 12px;
+  line-height: 1.45;
+  font-weight: 700;
+}
+
+.liveops-task-tags,
+.liveops-task-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.liveops-task-tags {
+  justify-content: flex-end;
+}
+
+.liveops-task-tag,
+.liveops-task-meta-item {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: var(--live-surface-muted);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.liveops-task-tag.is-pending {
+  color: var(--live-muted);
+}
+
+.liveops-task-tag.is-progress {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.12);
+}
+
+.liveops-task-tag.is-blocked {
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.liveops-task-tag.is-done {
+  color: #047857;
+  background: rgba(16, 185, 129, 0.12);
+}
+
+.liveops-task-meta {
+  margin-top: 12px;
+}
+
+.liveops-task-body {
+  margin: 12px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--live-border);
+  color: var(--live-soft);
+  font-size: 13px;
+  line-height: 1.7;
+  font-weight: 600;
+}
+
+.liveops-empty {
+  border: 1px dashed var(--live-border-strong);
+  border-radius: 22px;
+  padding: 24px;
+  text-align: center;
+  color: var(--live-muted);
+  font-size: 14px;
+  line-height: 1.65;
+  font-weight: 700;
+}
+
+@media (max-width: 1160px) {
+  .liveops-hero-grid,
+  .liveops-focus {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .liveops-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 920px) {
+  .liveops-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 720px) {
+  body {
+    padding: 14px;
+  }
+
+  .liveops-hero,
+  .liveops-panel,
+  .liveops-metric-card,
+  .liveops-stage-card {
+    border-radius: 24px;
+  }
+
+  .liveops-hero {
+    padding: 22px 20px 18px;
+  }
+
+  .liveops-title {
+    max-width: none;
+  }
+
+  .liveops-hero-footer,
+  .liveops-metrics,
+  .liveops-status-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .liveops-task-head {
+    flex-direction: column;
+  }
+
+  .liveops-task-tags {
+    justify-content: flex-start;
+  }
+
+  .liveops-actions {
+    width: 100%;
+  }
+
+  .liveops-link,
+  .liveops-button {
+    flex: 1 1 160px;
+  }
+}

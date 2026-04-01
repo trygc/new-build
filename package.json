@@ -1,0 +1,14 @@
+{
+  "name": "trygc-dashboard-published-build",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Locally runnable reconstruction of the published TryGC dashboard build extracted from Vercel.",
+  "scripts": {
+    "start": "node server.mjs",
+    "preview": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

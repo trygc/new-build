@@ -1,0 +1,7 @@
+{
+  "framework": null,
+  "outputDirectory": "site",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}
