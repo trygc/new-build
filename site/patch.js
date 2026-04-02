@@ -10,6 +10,11 @@
   var TOAST_HOST_ID = 'trygc-patch-toast-host';
   var SNAPSHOT_POLL_MS = 8000;
   var HEARTBEAT_MS = 30000;
+  var BACKGROUND_POLL_MS = 25000;
+  var FETCH_TIMEOUT_MS = 12000;
+  var SNAPSHOT_CACHE_TTL_MS = 120000;
+  var SNAPSHOT_CACHE_KEY = 'trygc-live-ops-snapshots';
+  var ROUTE_SYNC_DEBOUNCE_MS = 120;
 
   var initialized = false;
   var seenNotifIds = new Set();
@@ -26,9 +31,15 @@
   var presenceIdentity = '';
   var heartbeatTimer = null;
   var refreshTimer = null;
-  var routeMonitorTimer = null;
+  var refreshScheduleTimer = null;
+  var routeObserver = null;
+  var routeSyncTimer = null;
   var refreshInFlight = false;
   var rawLocalSetItem = null;
+  var presenceUnloadBound = false;
+  var widgetSignature = '';
+  var panelSignature = '';
+  var lastSnapshotStamp = '';
   var opsPageState = {
     host: null,
     panel: null,
@@ -36,6 +47,9 @@
     sourcePath: '',
     selectedAssignee: '',
     selectedTaskId: '',
+    searchQuery: '',
+    statusFilter: 'all',
+    sourceFilter: 'all',
     open: false
   };
   var notificationSortLock = false;
@@ -250,6 +264,139 @@
 
   function normalizeContext(task, fallback) {
     return String(task.campaign || task.country || task.teamName || fallback || 'Workspace').trim();
+  }
+
+  function statusTone(value) {
+    var status = String(value || '').trim().toLowerCase();
+    if (/done|complete|completed|closed/.test(status)) return 'done';
+    if (/block|stuck|hold/.test(status)) return 'blocked';
+    if (/progress|active|working|review|doing/.test(status)) return 'progress';
+    return 'pending';
+  }
+
+  function sourceLabel(value) {
+    var source = String(value || '').trim().toLowerCase();
+    if (source === 'community') return 'Community';
+    if (source === 'campaign') return 'Campaign';
+    if (source === 'standalone') return 'Standalone';
+    return 'Workspace';
+  }
+
+  function normalizeOpsFilter(value) {
+    return String(value || '').trim().toLowerCase() || 'all';
+  }
+
+  function formatSnapshotStamp(value) {
+    if (!value) return 'Awaiting live data';
+    var parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return 'Awaiting live data';
+    return parsed.toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit'
+    });
+  }
+
+  function deriveSnapshotStamp(workspace, community) {
+    var candidates = [
+      workspace && workspace.updatedAt,
+      community && community.updatedAt,
+      community && community.data && community.data.updatedAt
+    ];
+    var latest = '';
+    var latestTime = 0;
+    candidates.forEach(function (candidate) {
+      if (!candidate) return;
+      var time = new Date(candidate).getTime();
+      if (!Number.isNaN(time) && time >= latestTime) {
+        latestTime = time;
+        latest = candidate;
+      }
+    });
+    return latest;
+  }
+
+  function readSnapshotCache() {
+    try {
+      var raw = window.localStorage.getItem(SNAPSHOT_CACHE_KEY);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      if (!parsed.savedAt || Date.now() - Number(parsed.savedAt) > SNAPSHOT_CACHE_TTL_MS) {
+        return null;
+      }
+      return parsed;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function writeSnapshotCache(workspace, community) {
+    try {
+      window.localStorage.setItem(
+        SNAPSHOT_CACHE_KEY,
+        JSON.stringify({
+          savedAt: Date.now(),
+          workspace: workspace || {},
+          community: community || {}
+        })
+      );
+    } catch (err) {}
+  }
+
+  function hydrateSnapshotsFromCache() {
+    var cached = readSnapshotCache();
+    if (!cached) return false;
+    latestWorkspaceSnapshot = cached.workspace || {};
+    latestCommunitySnapshot = cached.community || {};
+    lastSnapshotStamp = deriveSnapshotStamp(latestWorkspaceSnapshot, latestCommunitySnapshot);
+    return true;
+  }
+
+  function filterOpsTasks(tasks) {
+    var query = normalizeOpsFilter(opsPageState.searchQuery);
+    var statusFilter = normalizeOpsFilter(opsPageState.statusFilter);
+    var sourceFilter = normalizeOpsFilter(opsPageState.sourceFilter);
+
+    return tasks.filter(function (task) {
+      if (statusFilter !== 'all' && normalizeOpsFilter(task.status) !== statusFilter) return false;
+      if (sourceFilter !== 'all' && normalizeOpsFilter(task.sourceType) !== sourceFilter) return false;
+      if (!query) return true;
+
+      var haystack = [
+        task.title,
+        task.description,
+        task.contextLabel,
+        task.assigneeLabel,
+        task.assigneeEmail,
+        task.priority,
+        task.status,
+        sourceLabel(task.sourceType)
+      ]
+        .join(' ')
+        .toLowerCase();
+
+      return haystack.indexOf(query) >= 0;
+    });
+  }
+
+  function activeSnapshotPollMs() {
+    return document.visibilityState === 'hidden' ? BACKGROUND_POLL_MS : SNAPSHOT_POLL_MS;
+  }
+
+  function scheduleSnapshotRefresh(delay) {
+    window.clearTimeout(refreshScheduleTimer);
+    refreshScheduleTimer = window.setTimeout(function () {
+      refreshSnapshots();
+    }, typeof delay === 'number' ? delay : activeSnapshotPollMs());
+  }
+
+  function scheduleRouteSync(delay) {
+    window.clearTimeout(routeSyncTimer);
+    routeSyncTimer = window.setTimeout(function () {
+      syncRouteView();
+    }, typeof delay === 'number' ? delay : ROUTE_SYNC_DEBOUNCE_MS);
   }
 
   function createAssignmentEntry(task, sourceType, contextLabel) {
@@ -561,20 +708,29 @@
   }
 
   function findLiveUsersWidget() {
+    if (opsPageState.widget && document.body && document.body.contains(opsPageState.widget)) {
+      return opsPageState.widget;
+    }
+
     var labels = document.querySelectorAll('h1,h2,h3,h4,p,span,div');
+    var markers = ['live users', 'active users', 'live active users'];
     var i;
     for (i = 0; i < labels.length; i += 1) {
       var node = labels[i];
       if (!node || !node.textContent) continue;
       if (node.closest('[data-trygc-ops-panel-shell],[data-trygc-ops-widget]')) continue;
-      var text = String(node.textContent || '').trim();
-      if (text !== 'Live Users' && text !== 'Active Users' && text !== 'Live Active Users') continue;
+      var text = String(node.textContent || '').trim().toLowerCase();
+      if (!markers.some(function (marker) { return text === marker; })) continue;
       var container = node.closest('.app-panel, .app-surface-card, article, section, [class*="rounded"]');
       if (!container) continue;
-      var containerText = String(container.textContent || '');
-      if (containerText.indexOf('online now') === -1 && containerText.indexOf('Connecting to presence') === -1 && containerText.indexOf('No other users online') === -1) {
+      var containerText = String(container.textContent || '').toLowerCase();
+      if (containerText.indexOf('online now') === -1 &&
+          containerText.indexOf('connecting to presence') === -1 &&
+          containerText.indexOf('no other users online') === -1 &&
+          containerText.indexOf('active now') === -1) {
         continue;
       }
+      container.setAttribute('data-trygc-ops-anchor', 'true');
       return container;
     }
     return null;
@@ -626,6 +782,8 @@
     var container = findLiveUsersWidget();
     if (!container) {
       opsPageState.widget = null;
+      widgetSignature = '';
+      panelSignature = '';
       if (opsPageState.panel && opsPageState.panel.parentNode) {
         opsPageState.panel.hidden = true;
       }
@@ -646,7 +804,8 @@
     }
 
     var previewUsers = liveUsers.slice(0, 4);
-    widget.innerHTML =
+    var snapshotLabel = formatSnapshotStamp(lastSnapshotStamp);
+    var markup =
       '<div class="trygc-ops-widget-head">' +
       '  <div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Live Ops</div>' +
       '  <button type="button" class="' + (opsPageState.open
@@ -658,11 +817,25 @@
       '  <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 px-3 py-3"><div class="text-2xl font-black text-zinc-900 dark:text-zinc-100">' + tasks.length + '</div><div class="mt-1 text-[10px] font-black uppercase tracking-wider text-zinc-400">Assigned tasks</div></div>' +
       '  <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 px-3 py-3"><div class="text-2xl font-black text-zinc-900 dark:text-zinc-100">' + assignees.length + '</div><div class="mt-1 text-[10px] font-black uppercase tracking-wider text-zinc-400">Owners</div></div>' +
       '</div>' +
+      '<div class="mt-3 text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Latest sync: ' + escapeHtml(snapshotLabel) + '</div>' +
       (previewUsers.length
         ? '<div class="trygc-ops-widget-users">' + previewUsers.map(function (user) {
-            return '<span class="inline-flex items-center gap-2 rounded-full bg-zinc-100 dark:bg-zinc-800 px-3 py-1.5 text-[11px] font-bold text-zinc-700 dark:text-zinc-300"><span class="trygc-ops-dot"></span>' + escapeHtml(user.name || user.email) + '</span>';
+            return '<span class="inline-flex items-center gap-2 rounded-full bg-zinc-100 dark:bg-zinc-800 px-3 py-1.5 text-[11px] font-bold text-zinc-700 dark:text-zinc-300"><span class="trygc-ops-dot"></span>' + escapeHtml(user.name || user.email) + (user.page ? '<span class="opacity-60">· ' + escapeHtml(normalizePath(user.page)) + '</span>' : '') + '</span>';
           }).join('') + '</div>'
         : '<div class="mt-3 text-xs font-medium text-zinc-500 dark:text-zinc-400">Presence updates will appear here as users refresh into the latest build.</div>');
+
+    var nextSignature = [
+      opsPageState.open ? '1' : '0',
+      tasks.length,
+      assignees.length,
+      snapshotLabel,
+      liveUsers.map(function (user) { return user.email + ':' + normalizePath(user.page); }).join('|')
+    ].join('::');
+
+    if (nextSignature !== widgetSignature || widget.innerHTML !== markup) {
+      widget.innerHTML = markup;
+      widgetSignature = nextSignature;
+    }
 
     widget.onclick = function (event) {
       var button = event.target && event.target.closest ? event.target.closest('[data-open-ops-panel="true"]') : null;
@@ -684,7 +857,8 @@
     opsPageState.panel.hidden = false;
 
     var tasks = collectOpsTasks(latestWorkspaceSnapshot || {}, latestCommunitySnapshot || {});
-    var assignees = collectAssigneeStats(tasks);
+    var filteredTasks = filterOpsTasks(tasks);
+    var assignees = collectAssigneeStats(filteredTasks);
     var activeCount = liveUsers.length;
     var selectedAssignee = opsPageState.selectedAssignee;
 
@@ -695,15 +869,17 @@
 
     var selectedGroup = assignees.find(function (item) { return item.key === selectedAssignee; }) || null;
     var selectedTasks = selectedGroup ? selectedGroup.tasks : [];
-    var totalAssigned = tasks.length;
+    var totalAssigned = filteredTasks.length;
     var peopleCount = assignees.length;
     var pathLabel = opsPageState.sourcePath === '/tasks-daily-routines'
       ? 'Tasks & Daily Routines'
       : opsPageState.sourcePath === '/tasks'
         ? 'All Tasks'
         : 'Dashboard';
-
-    opsPageState.host.innerHTML =
+    var snapshotLabel = formatSnapshotStamp(lastSnapshotStamp);
+    var normalizedStatusFilter = normalizeOpsFilter(opsPageState.statusFilter);
+    var normalizedSourceFilter = normalizeOpsFilter(opsPageState.sourceFilter);
+    var markup =
       '<div class="trygc-ops-shell app-panel rounded-[var(--app-card-radius)] border p-5 md:p-6">' +
       '  <div class="trygc-ops-wrap">' +
       '    <div class="trygc-ops-head">' +
@@ -717,16 +893,24 @@
       '        <button type="button" class="flex items-center gap-2 px-4 py-2.5 bg-zinc-100 dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 rounded-2xl font-black text-sm hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-all" data-ops-action="close"><span class="trygc-ops-button-label">Collapse</span></button>' +
       '      </div>' +
       '    </div>' +
+      '    <div class="app-panel rounded-[var(--app-card-radius)] border p-4 md:p-5">' +
+      '      <div class="trygc-ops-filter-grid">' +
+      '        <label class="trygc-ops-filter-field"><span class="trygc-ops-filter-label">Search</span><input data-ops-input="search" value="' + escapeHtml(opsPageState.searchQuery) + '" class="trygc-ops-filter-input" type="text" placeholder="Search task, owner, status, or context" /></label>' +
+      '        <label class="trygc-ops-filter-field"><span class="trygc-ops-filter-label">Status</span><select data-ops-input="status" class="trygc-ops-filter-input"><option value="all"' + (normalizedStatusFilter === 'all' ? ' selected' : '') + '>All statuses</option><option value="pending"' + (normalizedStatusFilter === 'pending' ? ' selected' : '') + '>Pending</option><option value="in progress"' + (normalizedStatusFilter === 'in progress' ? ' selected' : '') + '>In progress</option><option value="blocked"' + (normalizedStatusFilter === 'blocked' ? ' selected' : '') + '>Blocked</option><option value="done"' + (normalizedStatusFilter === 'done' ? ' selected' : '') + '>Done</option></select></label>' +
+      '        <label class="trygc-ops-filter-field"><span class="trygc-ops-filter-label">Source</span><select data-ops-input="source" class="trygc-ops-filter-input"><option value="all"' + (normalizedSourceFilter === 'all' ? ' selected' : '') + '>All sources</option><option value="workspace"' + (normalizedSourceFilter === 'workspace' ? ' selected' : '') + '>Workspace</option><option value="campaign"' + (normalizedSourceFilter === 'campaign' ? ' selected' : '') + '>Campaign</option><option value="community"' + (normalizedSourceFilter === 'community' ? ' selected' : '') + '>Community</option><option value="standalone"' + (normalizedSourceFilter === 'standalone' ? ' selected' : '') + '>Standalone</option></select></label>' +
+      '      </div>' +
+      '      <div class="mt-3 flex flex-wrap items-center justify-between gap-3 text-[11px] font-medium text-zinc-500 dark:text-zinc-400"><span>Latest sync: ' + escapeHtml(snapshotLabel) + '</span><span>' + escapeHtml(String(totalAssigned)) + ' matching tasks across ' + escapeHtml(String(peopleCount)) + ' owners</span></div>' +
+      '    </div>' +
       '    <div class="trygc-ops-stats">' +
       '      <div class="app-panel rounded-[var(--app-card-radius)] border p-5"><div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Live Active Users</div><div class="mt-3 text-3xl font-black tracking-tight text-zinc-900 dark:text-zinc-100">' + activeCount + '</div><div class="mt-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">Realtime presence across the tool</div></div>' +
-      '      <div class="app-panel rounded-[var(--app-card-radius)] border p-5"><div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Tasks Assigned To People</div><div class="mt-3 text-3xl font-black tracking-tight text-zinc-900 dark:text-zinc-100">' + totalAssigned + '</div><div class="mt-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">Excludes team or unassigned tasks</div></div>' +
+      '      <div class="app-panel rounded-[var(--app-card-radius)] border p-5"><div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Filtered Tasks</div><div class="mt-3 text-3xl font-black tracking-tight text-zinc-900 dark:text-zinc-100">' + totalAssigned + '</div><div class="mt-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">Person-only assignments after current filters are applied</div></div>' +
       '      <div class="app-panel rounded-[var(--app-card-radius)] border p-5"><div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">People With Assignments</div><div class="mt-3 text-3xl font-black tracking-tight text-zinc-900 dark:text-zinc-100">' + peopleCount + '</div><div class="mt-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">' + escapeHtml(selectedGroup ? selectedGroup.label + ' · ' + selectedGroup.count + ' tasks selected' : 'Choose an owner from the left rail') + '</div></div>' +
       '    </div>' +
       '    <div class="app-panel rounded-[var(--app-card-radius)] border p-5">' +
       '      <div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Live Users</div>' +
       (liveUsers.length
         ? '<div class="trygc-ops-users">' + liveUsers.map(function (user) {
-            return '<span class="inline-flex items-center gap-2 rounded-full bg-zinc-100 dark:bg-zinc-800 px-3 py-1.5 text-xs font-bold text-zinc-700 dark:text-zinc-300"><span class="trygc-ops-dot"></span>' + escapeHtml(user.name || user.email) + '</span>';
+            return '<span class="inline-flex items-center gap-2 rounded-full bg-zinc-100 dark:bg-zinc-800 px-3 py-1.5 text-xs font-bold text-zinc-700 dark:text-zinc-300"><span class="trygc-ops-dot"></span>' + escapeHtml(user.name || user.email) + (user.page ? '<span class="opacity-60">· ' + escapeHtml(normalizePath(user.page)) + '</span>' : '') + '</span>';
           }).join('') + '</div>'
         : '<div class="mt-4 rounded-2xl border border-dashed border-zinc-200 dark:border-zinc-800 px-4 py-5 text-sm font-medium text-zinc-500 dark:text-zinc-400 text-center">No live users detected yet. A refresh after the new deploy will make active sessions appear here.</div>') +
       '    </div>' +
@@ -749,6 +933,7 @@
       (selectedTasks.length
         ? '<div class="trygc-ops-tasks">' + selectedTasks.map(function (task) {
             var isOpen = opsPageState.selectedTaskId === task.id;
+            var tone = statusTone(task.status);
             return '' +
               '<button type="button" class="trygc-ops-task rounded-2xl border px-4 py-4 transition-all ' + (isOpen
                 ? 'border-[rgba(var(--app-primary-rgb),0.12)] bg-zinc-50 dark:bg-zinc-900'
@@ -756,9 +941,9 @@
               '  <div class="text-sm font-bold leading-6 text-zinc-800 dark:text-zinc-100">' + escapeHtml(task.title) + '</div>' +
               '  <div class="trygc-ops-task-meta">' +
               '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide">' + escapeHtml(task.contextLabel) + '</span>' +
-              '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide">' + escapeHtml(task.status) + '</span>' +
+              '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide" data-status-tone="' + escapeHtml(tone) + '">' + escapeHtml(task.status) + '</span>' +
               '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide">' + escapeHtml(task.priority) + '</span>' +
-              '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide">' + escapeHtml(task.sourceType) + '</span>' +
+              '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide">' + escapeHtml(sourceLabel(task.sourceType)) + '</span>' +
               '  </div>' +
               (isOpen ? '<div class="mt-3 border-t border-zinc-200 dark:border-zinc-800 pt-3 text-sm font-medium leading-relaxed text-zinc-500 dark:text-zinc-400">' + escapeHtml(task.description || 'No extra notes for this task yet.') + '</div>' : '') +
               '</button>';
@@ -768,6 +953,11 @@
       '    </div>' +
       '  </div>' +
       '</div>';
+
+    if (markup !== panelSignature || opsPageState.host.innerHTML !== markup) {
+      opsPageState.host.innerHTML = markup;
+      panelSignature = markup;
+    }
 
     opsPageState.host.onclick = function (event) {
       var action = event.target && event.target.closest ? event.target.closest('[data-ops-action],[data-assignee-key],[data-task-id]') : null;
@@ -797,6 +987,28 @@
         opsPageState.selectedTaskId = opsPageState.selectedTaskId === taskId ? '' : taskId;
         renderOpsPage();
       }
+    };
+
+    opsPageState.host.oninput = function (event) {
+      var input = event.target && event.target.closest ? event.target.closest('[data-ops-input="search"]') : null;
+      if (!input) return;
+      opsPageState.searchQuery = input.value || '';
+      opsPageState.selectedTaskId = '';
+      renderOpsPage();
+    };
+
+    opsPageState.host.onchange = function (event) {
+      var input = event.target && event.target.closest ? event.target.closest('[data-ops-input]') : null;
+      if (!input) return;
+      if (input.getAttribute('data-ops-input') === 'status') {
+        opsPageState.statusFilter = input.value || 'all';
+      } else if (input.getAttribute('data-ops-input') === 'source') {
+        opsPageState.sourceFilter = input.value || 'all';
+      } else {
+        return;
+      }
+      opsPageState.selectedTaskId = '';
+      renderOpsPage();
     };
   }
 
@@ -879,12 +1091,14 @@
       .map(function (item) {
         var clone = Object.assign({}, item);
         clone.pinned = isPinnedUpdateNotification(item);
+        clone.read = !!item.read;
         return clone;
       })
       .sort(function (a, b) {
         var aPinned = a.pinned ? 1 : 0;
         var bPinned = b.pinned ? 1 : 0;
         if (aPinned !== bPinned) return bPinned - aPinned;
+        if (a.read !== b.read) return a.read ? 1 : -1;
         return notificationTimestamp(b) - notificationTimestamp(a);
       });
   }
@@ -954,12 +1168,14 @@
         seenNotifIds.add(id);
         if (item.read) return;
 
-        var title = item.taskName || item.title || 'Assignment Update';
+        var campaign = item.taskName || item.title || 'Assignment Update';
+        var taskTitle = item.taskDescription || item.description || '';
         var assignee = item.assignedToName || item.assignedToEmail || item.assignedTo || '';
-        var detail = item.taskDescription || item.description || '';
-        var message = assignee
-          ? title + ' -> ' + assignee + (detail ? ' | ' + String(detail).substring(0, 90) : '')
-          : detail || title;
+        var message = taskTitle
+          ? taskTitle + (assignee ? ' -> ' + assignee : '') + ' • ' + campaign
+          : assignee
+            ? campaign + ' -> ' + assignee
+            : campaign;
         dispatchAlert('Assignment Update', message, 'notif:' + id);
       });
     } catch (err) {}
@@ -980,16 +1196,31 @@
   }
 
   function fetchJson(url) {
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timeoutId = controller
+      ? window.setTimeout(function () {
+          try {
+            controller.abort();
+          } catch (err) {}
+        }, FETCH_TIMEOUT_MS)
+      : null;
+
     return window.fetch(url, {
       method: 'GET',
+      cache: 'no-store',
+      signal: controller ? controller.signal : undefined,
       headers: {
         Authorization: 'Bearer ' + PUBLIC_ANON_KEY
       }
     }).then(function (response) {
+      if (timeoutId) window.clearTimeout(timeoutId);
       if (!response.ok) {
         throw new Error('Request failed: ' + response.status);
       }
       return response.json();
+    }).catch(function (error) {
+      if (timeoutId) window.clearTimeout(timeoutId);
+      throw error;
     });
   }
 
@@ -1007,16 +1238,19 @@
       })
     ])
       .then(function (results) {
-        var workspace = results[0] || {};
-        var community = results[1] || {};
+        var workspace = results[0] || latestWorkspaceSnapshot || {};
+        var community = results[1] || latestCommunitySnapshot || {};
         latestWorkspaceSnapshot = workspace;
         latestCommunitySnapshot = community;
+        lastSnapshotStamp = deriveSnapshotStamp(workspace, community);
+        writeSnapshotCache(workspace, community);
         notifyAssignmentChanges(collectAssignments(workspace, community));
         renderOpsPage();
       })
       .catch(function () {})
       .finally(function () {
         refreshInFlight = false;
+        scheduleSnapshotRefresh();
       });
   }
 
@@ -1101,11 +1335,14 @@
         }
       });
 
-      window.addEventListener('beforeunload', function () {
-        try {
-          channel.untrack().catch(function () {});
-        } catch (err) {}
-      });
+      if (!presenceUnloadBound) {
+        presenceUnloadBound = true;
+        window.addEventListener('beforeunload', function () {
+          try {
+            if (presenceChannel) presenceChannel.untrack().catch(function () {});
+          } catch (err) {}
+        });
+      }
     });
   }
 
@@ -1168,6 +1405,22 @@
     });
   }
 
+  function installRouteObserver() {
+    if (routeObserver || typeof MutationObserver !== 'function' || !document.body) return;
+
+    routeObserver = new MutationObserver(function (mutations) {
+      var changed = mutations.some(function (mutation) {
+        return mutation.addedNodes.length || mutation.removedNodes.length;
+      });
+      if (changed) scheduleRouteSync();
+    });
+
+    routeObserver.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+
   function installOpsLinkInterceptor() {
     document.addEventListener(
       'click',
@@ -1203,7 +1456,7 @@
           } catch (err) {}
         }
         var result = originalPushState.apply(this, arguments);
-        window.setTimeout(syncRouteView, 0);
+        scheduleRouteSync(0);
         return result;
       };
     }
@@ -1221,12 +1474,14 @@
           } catch (err) {}
         }
         var result = originalReplaceState.apply(this, arguments);
-        window.setTimeout(syncRouteView, 0);
+        scheduleRouteSync(0);
         return result;
       };
     }
 
-    window.addEventListener('popstate', syncRouteView, true);
+    window.addEventListener('popstate', function () {
+      scheduleRouteSync(0);
+    }, true);
     forceOpsDocumentNavigation();
   }
 
@@ -1241,15 +1496,20 @@
     installOpsLinkInterceptor();
     installOpsHistoryInterceptor();
     installFetchHook();
+    installRouteObserver();
     startPresenceTracking();
+    hydrateSnapshotsFromCache();
     syncRouteView();
+    renderOpsPage();
     refreshSnapshots();
     if (rawLocalSetItem) normalizeStoredNotifications(rawLocalSetItem);
     checkLocalNotifications();
 
-    window.setInterval(refreshSnapshots, SNAPSHOT_POLL_MS);
     window.setInterval(checkLocalNotifications, 4000);
-    routeMonitorTimer = window.setInterval(syncRouteView, 700);
+    document.addEventListener('visibilitychange', function () {
+      scheduleSnapshotRefresh(300);
+      scheduleRouteSync(60);
+    });
   }
 
   if (document.readyState === 'loading') {
