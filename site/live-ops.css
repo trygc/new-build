@@ -240,14 +240,14 @@ select {
 
 .liveops-button {
   border: 0;
-  background: #111827;
-  color: #fff;
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
   cursor: pointer;
 }
 
 .dark .liveops-button {
-  background: #fafafa;
-  color: #111827;
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
 }
 
 .liveops-hero-footer {
@@ -261,12 +261,8 @@ select {
   min-height: 84px;
   border-radius: 22px;
   border: 1px solid var(--live-border);
-  background: rgba(255, 255, 255, 0.58);
+  background: var(--live-surface-muted);
   padding: 16px;
-}
-
-.dark .liveops-hero-stat {
-  background: rgba(24, 24, 27, 0.7);
 }
 
 .liveops-hero-stat-label {
@@ -475,15 +471,9 @@ select {
 }
 
 .liveops-roster-item.is-active {
-  background: #111827;
-  border-color: #111827;
-  color: #fff;
-}
-
-.dark .liveops-roster-item.is-active {
-  background: #fafafa;
-  border-color: #fafafa;
-  color: #111827;
+  background: hsl(var(--primary));
+  border-color: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
 }
 
 .liveops-roster-top {
@@ -523,11 +513,11 @@ select {
 }
 
 .liveops-roster-item.is-active .liveops-roster-count {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.22);
 }
 
 .dark .liveops-roster-item.is-active .liveops-roster-count {
-  background: rgba(17, 24, 39, 0.08);
+  background: rgba(17, 24, 39, 0.16);
 }
 
 .liveops-stage {
@@ -704,14 +694,29 @@ select {
   background: rgba(245, 158, 11, 0.12);
 }
 
+.dark .liveops-task-tag.is-progress {
+  color: rgb(251 191 36);
+  background: rgba(245, 158, 11, 0.16);
+}
+
 .liveops-task-tag.is-blocked {
   color: #b91c1c;
   background: rgba(239, 68, 68, 0.12);
 }
 
+.dark .liveops-task-tag.is-blocked {
+  color: rgb(252 165 165);
+  background: rgba(239, 68, 68, 0.16);
+}
+
 .liveops-task-tag.is-done {
   color: #047857;
   background: rgba(16, 185, 129, 0.12);
+}
+
+.dark .liveops-task-tag.is-done {
+  color: rgb(110 231 183);
+  background: rgba(16, 185, 129, 0.16);
 }
 
 .liveops-task-meta {

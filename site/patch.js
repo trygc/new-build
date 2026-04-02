@@ -7,11 +7,39 @@
   var API_BASE = 'https://' + PROJECT_ID + '.supabase.co/functions/v1/make-server-b626472b';
   var AUTH_KEYS = ['supabase.auth.token', 'sb-' + PROJECT_ID + '-auth-token'];
   var NOTIF_KEY = 'trygc-task-notifications';
+  var COMMUNITY_KEY = 'trygc-community-workspace';
+  var STANDALONE_TASKS_PREFIX = 'trygc-standalone-tasks:';
   var TOAST_HOST_ID = 'trygc-patch-toast-host';
   var SNAPSHOT_POLL_MS = 8000;
   var HEARTBEAT_MS = 30000;
+  var BACKGROUND_POLL_MS = 25000;
+  var FETCH_TIMEOUT_MS = 12000;
+  var SNAPSHOT_CACHE_TTL_MS = 120000;
+  var SNAPSHOT_CACHE_KEY = 'trygc-live-ops-snapshots';
+  var ROUTE_SYNC_DEBOUNCE_MS = 120;
+  var TOAST_LIMIT = 3;
+  var TOAST_LIFETIME_MS = 4500;
+  var NOTIFICATION_GRACE_PERIOD_MS = 120000;
+  var SAVE_DEBOUNCE_MS = 1200;
+  var SAVE_RETRY_MS = 5000;
+  var SEEN_NOTIFICATION_LIMIT = 600;
+  var RECENT_ALERT_LIMIT = 250;
+  var WORKSPACE_STORAGE_MAP = [
+    { key: 'trygc-tasks', field: 'tasks', fallback: [] },
+    { key: 'trygc-task-notifications', field: 'taskNotifications', fallback: [] },
+    { key: 'trygc-tasks-per-team', field: 'tasksPerTeam', fallback: {} },
+    { key: 'trygc-ops-campaigns', field: 'opsCampaigns', fallback: [] },
+    { key: 'trygc-success-logs', field: 'successLogs', fallback: [] },
+    { key: 'trygc-mistakes', field: 'mistakes', fallback: [] },
+    { key: 'trygc-campaign-intakes', field: 'campaignIntakes', fallback: [] },
+    { key: 'trygc-organized-updates', field: 'organizedUpdates', fallback: [] },
+    { key: 'trygc-link-widgets', field: 'linkWidgets', fallback: [] },
+    { key: 'trygc-shift-handovers', field: 'shiftHandovers', fallback: [] },
+    { key: 'trygc-coverage-records', field: 'coverageRecords', fallback: [] }
+  ];
 
   var initialized = false;
+  var patchBootTime = Date.now();
   var seenNotifIds = new Set();
   var recentAlertIds = new Set();
   var currentAssignments = new Map();
@@ -26,9 +54,24 @@
   var presenceIdentity = '';
   var heartbeatTimer = null;
   var refreshTimer = null;
-  var routeMonitorTimer = null;
+  var refreshScheduleTimer = null;
+  var routeObserver = null;
+  var routeSyncTimer = null;
   var refreshInFlight = false;
+  var summaryWidgetInterceptorInstalled = false;
   var rawLocalSetItem = null;
+  var presenceUnloadBound = false;
+  var workspaceSaveTimer = null;
+  var communitySaveTimer = null;
+  var workspaceSaveInFlight = false;
+  var communitySaveInFlight = false;
+  var workspaceSaveQueued = false;
+  var communitySaveQueued = false;
+  var lastWorkspaceSaveFingerprint = '';
+  var lastCommunitySaveFingerprint = '';
+  var widgetSignature = '';
+  var panelSignature = '';
+  var lastSnapshotStamp = '';
   var opsPageState = {
     host: null,
     panel: null,
@@ -36,6 +79,9 @@
     sourcePath: '',
     selectedAssignee: '',
     selectedTaskId: '',
+    searchQuery: '',
+    statusFilter: 'all',
+    sourceFilter: 'all',
     open: false
   };
   var notificationSortLock = false;
@@ -47,6 +93,59 @@
     } catch (err) {
       return null;
     }
+  }
+
+  function cloneJson(value, fallback) {
+    if (value === undefined || value === null) return fallback === undefined ? value : fallback;
+    try {
+      return JSON.parse(JSON.stringify(value));
+    } catch (err) {
+      return fallback === undefined ? value : fallback;
+    }
+  }
+
+  function fingerprintValue(value) {
+    function normalize(input) {
+      if (Array.isArray(input)) {
+        return input.map(normalize);
+      }
+      if (!input || typeof input !== 'object') {
+        return input;
+      }
+      var sorted = {};
+      Object.keys(input)
+        .sort()
+        .forEach(function (key) {
+          sorted[key] = normalize(input[key]);
+        });
+      return sorted;
+    }
+
+    try {
+      return JSON.stringify(normalize(value));
+    } catch (err) {
+      return '';
+    }
+  }
+
+  function trimSet(set, maxSize) {
+    while (set.size > maxSize) {
+      var oldest = set.values().next();
+      if (oldest.done) return;
+      set.delete(oldest.value);
+    }
+  }
+
+  function listStorageKeys() {
+    var keys = [];
+    var index;
+    for (index = 0; index < window.localStorage.length; index += 1) {
+      try {
+        var key = window.localStorage.key(index);
+        if (key) keys.push(key);
+      } catch (err) {}
+    }
+    return keys;
   }
 
   function getCurrentUser() {
@@ -93,6 +192,9 @@
       toastHost.style.flexDirection = 'column';
       toastHost.style.gap = '10px';
       toastHost.style.maxWidth = '360px';
+      toastHost.style.width = 'min(360px, calc(100vw - 24px))';
+      toastHost.style.maxHeight = 'min(50vh, 480px)';
+      toastHost.style.overflow = 'hidden';
       toastHost.style.pointerEvents = 'none';
       document.body.appendChild(toastHost);
     }
@@ -100,10 +202,32 @@
     return toastHost;
   }
 
+  function dismissToast(item, immediate) {
+    if (!item || item.__trygcDismissed) return;
+    item.__trygcDismissed = true;
+    if (item.__trygcTimer) {
+      window.clearTimeout(item.__trygcTimer);
+      item.__trygcTimer = null;
+    }
+    if (immediate) {
+      if (item.parentNode) item.parentNode.removeChild(item);
+      return;
+    }
+    item.style.opacity = '0';
+    item.style.transform = 'translateY(8px)';
+    window.setTimeout(function () {
+      if (item.parentNode) item.parentNode.removeChild(item);
+    }, 180);
+  }
+
   function showToast(title, body) {
     if (!document.body) return;
 
     var host = ensureToastHost();
+    while (host.childNodes.length >= TOAST_LIMIT) {
+      dismissToast(host.firstChild, true);
+    }
+
     var item = document.createElement('div');
     item.style.pointerEvents = 'auto';
     item.style.border = '1px solid rgba(255,255,255,0.12)';
@@ -116,6 +240,13 @@
     item.style.transform = 'translateY(8px)';
     item.style.opacity = '0';
     item.style.transition = 'opacity 160ms ease, transform 160ms ease';
+    item.style.cursor = 'pointer';
+
+    var head = document.createElement('div');
+    head.style.display = 'flex';
+    head.style.alignItems = 'center';
+    head.style.justifyContent = 'space-between';
+    head.style.gap = '12px';
 
     var titleEl = document.createElement('div');
     titleEl.textContent = title;
@@ -124,15 +255,30 @@
     titleEl.style.letterSpacing = '0.12em';
     titleEl.style.textTransform = 'uppercase';
     titleEl.style.color = 'rgba(255,255,255,0.72)';
-    titleEl.style.marginBottom = '6px';
+
+    var closeButton = document.createElement('button');
+    closeButton.type = 'button';
+    closeButton.setAttribute('aria-label', 'Dismiss notification');
+    closeButton.textContent = 'x';
+    closeButton.style.border = '0';
+    closeButton.style.background = 'transparent';
+    closeButton.style.color = 'rgba(255,255,255,0.76)';
+    closeButton.style.fontSize = '15px';
+    closeButton.style.fontWeight = '800';
+    closeButton.style.lineHeight = '1';
+    closeButton.style.padding = '0';
+    closeButton.style.cursor = 'pointer';
 
     var bodyEl = document.createElement('div');
     bodyEl.textContent = body;
     bodyEl.style.fontSize = '13px';
     bodyEl.style.fontWeight = '600';
     bodyEl.style.lineHeight = '1.45';
+    bodyEl.style.marginTop = '6px';
 
-    item.appendChild(titleEl);
+    head.appendChild(titleEl);
+    head.appendChild(closeButton);
+    item.appendChild(head);
     item.appendChild(bodyEl);
     host.appendChild(item);
 
@@ -141,13 +287,17 @@
       item.style.transform = 'translateY(0)';
     });
 
-    window.setTimeout(function () {
-      item.style.opacity = '0';
-      item.style.transform = 'translateY(8px)';
-      window.setTimeout(function () {
-        if (item.parentNode) item.parentNode.removeChild(item);
-      }, 180);
-    }, 6000);
+    closeButton.addEventListener('click', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      dismissToast(item);
+    });
+    item.addEventListener('click', function () {
+      dismissToast(item);
+    });
+    item.__trygcTimer = window.setTimeout(function () {
+      dismissToast(item);
+    }, TOAST_LIFETIME_MS);
   }
 
   function ensureAudio() {
@@ -252,6 +402,386 @@
     return String(task.campaign || task.country || task.teamName || fallback || 'Workspace').trim();
   }
 
+  function statusTone(value) {
+    var status = String(value || '').trim().toLowerCase();
+    if (/done|complete|completed|closed/.test(status)) return 'done';
+    if (/block|stuck|hold/.test(status)) return 'blocked';
+    if (/progress|active|working|review|doing/.test(status)) return 'progress';
+    return 'pending';
+  }
+
+  function sourceLabel(value) {
+    var source = String(value || '').trim().toLowerCase();
+    if (source === 'community') return 'Community';
+    if (source === 'campaign') return 'Campaign';
+    if (source === 'standalone') return 'Standalone';
+    return 'Workspace';
+  }
+
+  function normalizeOpsFilter(value) {
+    return String(value || '').trim().toLowerCase() || 'all';
+  }
+
+  function formatSnapshotStamp(value) {
+    if (!value) return 'Awaiting live data';
+    var parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return 'Awaiting live data';
+    return parsed.toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit'
+    });
+  }
+
+  function deriveSnapshotStamp(workspace, community) {
+    var candidates = [
+      workspace && workspace.updatedAt,
+      community && community.updatedAt,
+      community && community.data && community.data.updatedAt
+    ];
+    var latest = '';
+    var latestTime = 0;
+    candidates.forEach(function (candidate) {
+      if (!candidate) return;
+      var time = new Date(candidate).getTime();
+      if (!Number.isNaN(time) && time >= latestTime) {
+        latestTime = time;
+        latest = candidate;
+      }
+    });
+    return latest;
+  }
+
+  function readSnapshotCache() {
+    try {
+      var raw = window.localStorage.getItem(SNAPSHOT_CACHE_KEY);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') return null;
+      if (!parsed.savedAt || Date.now() - Number(parsed.savedAt) > SNAPSHOT_CACHE_TTL_MS) {
+        return null;
+      }
+      return parsed;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function writeSnapshotCache(workspace, community) {
+    try {
+      window.localStorage.setItem(
+        SNAPSHOT_CACHE_KEY,
+        JSON.stringify({
+          savedAt: Date.now(),
+          workspace: workspace || {},
+          community: community || {}
+        })
+      );
+    } catch (err) {}
+  }
+
+  function hydrateSnapshotsFromCache() {
+    var cached = readSnapshotCache();
+    if (!cached) return false;
+    latestWorkspaceSnapshot = cached.workspace || {};
+    latestCommunitySnapshot = cached.community || {};
+    lastSnapshotStamp = deriveSnapshotStamp(latestWorkspaceSnapshot, latestCommunitySnapshot);
+    return true;
+  }
+
+  function hydrateSaveFingerprintsFromSnapshots() {
+    lastWorkspaceSaveFingerprint = fingerprintValue(latestWorkspaceSnapshot || {});
+    lastCommunitySaveFingerprint = fingerprintValue(latestCommunitySnapshot || {});
+  }
+
+  function isWorkspaceStorageKey(key) {
+    if (!key) return false;
+    if (key.indexOf(STANDALONE_TASKS_PREFIX) === 0) return true;
+    return WORKSPACE_STORAGE_MAP.some(function (entry) {
+      return entry.key === key;
+    });
+  }
+
+  function isRelevantNotification(item) {
+    if (!item) return false;
+    var bucket = [
+      item.type,
+      item.category,
+      item.notificationType,
+      item.kind,
+      item.title,
+      item.taskName,
+      item.taskDescription,
+      item.description
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    if (item.assignedTo || item.assignedToName || item.assignedToEmail) return true;
+    return /(assign|task|update)/.test(bucket);
+  }
+
+  function shouldSurfaceNotification(item) {
+    var timestamp = notificationTimestamp(item);
+    if (!timestamp) return true;
+    return timestamp >= patchBootTime - NOTIFICATION_GRACE_PERIOD_MS;
+  }
+
+  function readStandaloneTasks() {
+    var candidates = [];
+    var user = getCurrentUser();
+    if (user && user.email) {
+      candidates.push(STANDALONE_TASKS_PREFIX + String(user.email));
+      candidates.push(STANDALONE_TASKS_PREFIX + String(user.email).toLowerCase());
+    }
+    listStorageKeys().forEach(function (key) {
+      if (key && key.indexOf(STANDALONE_TASKS_PREFIX) === 0) candidates.push(key);
+    });
+
+    var seen = new Set();
+    var index;
+    for (index = 0; index < candidates.length; index += 1) {
+      var key = candidates[index];
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      var value = getStoredJson(key);
+      if (Array.isArray(value)) return value;
+    }
+    return null;
+  }
+
+  function buildWorkspacePayload() {
+    var payload = cloneJson(latestWorkspaceSnapshot, {}) || {};
+    WORKSPACE_STORAGE_MAP.forEach(function (entry) {
+      var value = getStoredJson(entry.key);
+      if (value !== null && value !== undefined) {
+        payload[entry.field] = value;
+      } else if (payload[entry.field] === undefined) {
+        payload[entry.field] = cloneJson(entry.fallback);
+      }
+    });
+
+    var standaloneTasks = readStandaloneTasks();
+    if (standaloneTasks !== null) {
+      payload.standaloneTasks = standaloneTasks;
+    } else if (!Array.isArray(payload.standaloneTasks)) {
+      payload.standaloneTasks = [];
+    }
+
+    return payload;
+  }
+
+  function buildCommunityPayload() {
+    var payload = getStoredJson(COMMUNITY_KEY);
+    if (payload === null || payload === undefined) {
+      payload = cloneJson(latestCommunitySnapshot, null);
+    }
+    if (!payload || typeof payload !== 'object') return null;
+    if (!payload.data && (payload.countries || payload.updatedAt || payload.metadata)) {
+      return { data: payload };
+    }
+    return payload;
+  }
+
+  function postJson(url, payload) {
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timeoutId = controller
+      ? window.setTimeout(function () {
+          try {
+            controller.abort();
+          } catch (err) {}
+        }, FETCH_TIMEOUT_MS)
+      : null;
+
+    return window.fetch(url, {
+      method: 'POST',
+      cache: 'no-store',
+      signal: controller ? controller.signal : undefined,
+      headers: {
+        Authorization: 'Bearer ' + PUBLIC_ANON_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }).then(function (response) {
+      if (timeoutId) window.clearTimeout(timeoutId);
+      if (!response.ok) {
+        throw new Error('Request failed: ' + response.status);
+      }
+      return response.json().catch(function () {
+        return null;
+      });
+    }).catch(function (error) {
+      if (timeoutId) window.clearTimeout(timeoutId);
+      throw error;
+    });
+  }
+
+  function scheduleWorkspacePersist(delay) {
+    workspaceSaveQueued = true;
+    window.clearTimeout(workspaceSaveTimer);
+    workspaceSaveTimer = window.setTimeout(function () {
+      persistWorkspaceSnapshot();
+    }, typeof delay === 'number' ? delay : SAVE_DEBOUNCE_MS);
+  }
+
+  function scheduleCommunityPersist(delay) {
+    communitySaveQueued = true;
+    window.clearTimeout(communitySaveTimer);
+    communitySaveTimer = window.setTimeout(function () {
+      persistCommunitySnapshot();
+    }, typeof delay === 'number' ? delay : SAVE_DEBOUNCE_MS);
+  }
+
+  function persistWorkspaceSnapshot(force) {
+    if (workspaceSaveInFlight) return Promise.resolve(false);
+
+    var payload = buildWorkspacePayload();
+    var fingerprint = fingerprintValue(payload);
+    if (!fingerprint) return Promise.resolve(false);
+    if (!force && fingerprint === lastWorkspaceSaveFingerprint) {
+      workspaceSaveQueued = false;
+      return Promise.resolve(true);
+    }
+
+    workspaceSaveQueued = false;
+    workspaceSaveInFlight = true;
+    var shouldRetry = false;
+
+    return postJson(API_BASE + '/workspace', payload)
+      .then(function () {
+        latestWorkspaceSnapshot = cloneJson(payload, payload);
+        lastWorkspaceSaveFingerprint = fingerprint;
+        lastSnapshotStamp = new Date().toISOString();
+        writeSnapshotCache(latestWorkspaceSnapshot, latestCommunitySnapshot);
+        scheduleRefresh(250);
+        return true;
+      })
+      .catch(function () {
+        shouldRetry = true;
+        workspaceSaveQueued = true;
+        return false;
+      })
+      .finally(function () {
+        workspaceSaveInFlight = false;
+        if (shouldRetry) {
+          window.clearTimeout(workspaceSaveTimer);
+          workspaceSaveTimer = window.setTimeout(function () {
+            persistWorkspaceSnapshot(true);
+          }, SAVE_RETRY_MS);
+          return;
+        }
+        if (workspaceSaveQueued) scheduleWorkspacePersist(300);
+      });
+  }
+
+  function persistCommunitySnapshot(force) {
+    if (communitySaveInFlight) return Promise.resolve(false);
+
+    var payload = buildCommunityPayload();
+    if (!payload) {
+      communitySaveQueued = false;
+      return Promise.resolve(false);
+    }
+
+    var fingerprint = fingerprintValue(payload);
+    if (!fingerprint) return Promise.resolve(false);
+    if (!force && fingerprint === lastCommunitySaveFingerprint) {
+      communitySaveQueued = false;
+      return Promise.resolve(true);
+    }
+
+    communitySaveQueued = false;
+    communitySaveInFlight = true;
+    var shouldRetry = false;
+
+    return postJson(API_BASE + '/community-team-data', payload)
+      .then(function () {
+        latestCommunitySnapshot = cloneJson(payload, payload);
+        lastCommunitySaveFingerprint = fingerprint;
+        lastSnapshotStamp = new Date().toISOString();
+        writeSnapshotCache(latestWorkspaceSnapshot, latestCommunitySnapshot);
+        scheduleRefresh(250);
+        return true;
+      })
+      .catch(function () {
+        shouldRetry = true;
+        communitySaveQueued = true;
+        return false;
+      })
+      .finally(function () {
+        communitySaveInFlight = false;
+        if (shouldRetry) {
+          window.clearTimeout(communitySaveTimer);
+          communitySaveTimer = window.setTimeout(function () {
+            persistCommunitySnapshot(true);
+          }, SAVE_RETRY_MS);
+          return;
+        }
+        if (communitySaveQueued) scheduleCommunityPersist(300);
+      });
+  }
+
+  function markWorkspacePersisted() {
+    var payload = buildWorkspacePayload();
+    latestWorkspaceSnapshot = cloneJson(payload, payload);
+    lastWorkspaceSaveFingerprint = fingerprintValue(payload);
+    writeSnapshotCache(latestWorkspaceSnapshot, latestCommunitySnapshot);
+  }
+
+  function markCommunityPersisted() {
+    var payload = buildCommunityPayload();
+    if (!payload) return;
+    latestCommunitySnapshot = cloneJson(payload, payload);
+    lastCommunitySaveFingerprint = fingerprintValue(payload);
+    writeSnapshotCache(latestWorkspaceSnapshot, latestCommunitySnapshot);
+  }
+
+  function filterOpsTasks(tasks) {
+    var query = normalizeOpsFilter(opsPageState.searchQuery);
+    var statusFilter = normalizeOpsFilter(opsPageState.statusFilter);
+    var sourceFilter = normalizeOpsFilter(opsPageState.sourceFilter);
+
+    return tasks.filter(function (task) {
+      if (statusFilter !== 'all' && normalizeOpsFilter(task.status) !== statusFilter) return false;
+      if (sourceFilter !== 'all' && normalizeOpsFilter(task.sourceType) !== sourceFilter) return false;
+      if (!query) return true;
+
+      var haystack = [
+        task.title,
+        task.description,
+        task.contextLabel,
+        task.assigneeLabel,
+        task.assigneeEmail,
+        task.priority,
+        task.status,
+        sourceLabel(task.sourceType)
+      ]
+        .join(' ')
+        .toLowerCase();
+
+      return haystack.indexOf(query) >= 0;
+    });
+  }
+
+  function activeSnapshotPollMs() {
+    return document.visibilityState === 'hidden' ? BACKGROUND_POLL_MS : SNAPSHOT_POLL_MS;
+  }
+
+  function scheduleSnapshotRefresh(delay) {
+    window.clearTimeout(refreshScheduleTimer);
+    refreshScheduleTimer = window.setTimeout(function () {
+      refreshSnapshots();
+    }, typeof delay === 'number' ? delay : activeSnapshotPollMs());
+  }
+
+  function scheduleRouteSync(delay) {
+    window.clearTimeout(routeSyncTimer);
+    routeSyncTimer = window.setTimeout(function () {
+      syncRouteView();
+    }, typeof delay === 'number' ? delay : ROUTE_SYNC_DEBOUNCE_MS);
+  }
+
   function createAssignmentEntry(task, sourceType, contextLabel) {
     var assignee = normalizeAssignee(task);
     return {
@@ -274,6 +804,13 @@
       value = value.slice(0, -1);
     }
     return value || '/';
+  }
+
+  function normalizeText(value) {
+    return String(value || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
   }
 
   function isOpsRoute(pathname) {
@@ -514,21 +1051,39 @@
     var style = document.createElement('style');
     style.id = 'trygc-ops-styles';
     style.textContent = [
-      '[data-trygc-ops-panel-shell]{margin-top:18px;}',
+      '[data-trygc-ops-panel-shell]{margin-top:20px;}',
       '[data-trygc-ops-panel-shell][hidden]{display:none !important;}',
-      '.trygc-ops-inline-shell{overflow:hidden;}',
-      '.trygc-ops-shell{padding:0;background:transparent;color:inherit;}',
-      '.trygc-ops-wrap{max-width:none;margin:0;display:flex;flex-direction:column;gap:18px;}',
+      '.trygc-ops-inline-shell{overflow:visible;}',
+      '.trygc-ops-shell{position:relative;overflow:hidden;padding:0;background:linear-gradient(180deg, rgba(var(--app-primary-rgb),0.06), rgba(255,255,255,0) 28%), transparent;color:inherit;}',
+      '.dark .trygc-ops-shell{background:linear-gradient(180deg, rgba(255,255,255,0.04), rgba(24,24,27,0) 30%), transparent;}',
+      '.trygc-ops-shell::before{content:"";position:absolute;inset:-8% auto auto 68%;width:240px;height:240px;border-radius:999px;background:radial-gradient(circle, rgba(var(--app-primary-rgb),0.14), transparent 70%);pointer-events:none;opacity:.85;}',
+      '.trygc-ops-wrap{position:relative;z-index:1;max-width:none;margin:0;display:flex;flex-direction:column;gap:18px;}',
       '.trygc-ops-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;}',
       '.trygc-ops-head > *,.trygc-ops-grid > *,.trygc-ops-stats > *,.trygc-ops-widget-head > *{min-width:0;}',
       '.trygc-ops-head-copy{flex:1 1 32rem;min-width:0;}',
-      '.trygc-ops-title-text{max-width:42rem;overflow-wrap:anywhere;word-break:break-word;}',
-      '.trygc-ops-copy-text{max-width:48rem;overflow-wrap:anywhere;}',
+      '.trygc-ops-kicker{display:block;line-height:1.35;padding-top:1px;}',
+      '.trygc-ops-title-text{max-width:42rem;overflow-wrap:anywhere;word-break:break-word;font-size:clamp(1.55rem,2.2vw,2.45rem);line-height:1.08 !important;letter-spacing:-.04em;}',
+      '.trygc-ops-copy-text{max-width:48rem;overflow-wrap:anywhere;font-size:14px;line-height:1.7;}',
       '.trygc-ops-head-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}',
       '.trygc-ops-head-actions button,.trygc-ops-widget-head button{max-width:100%;}',
       '.trygc-ops-button-label{display:block;white-space:nowrap;}',
+      '.trygc-ops-filter-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;}',
+      '.trygc-ops-filter-field{display:flex !important;flex-direction:column;gap:8px;min-width:0;margin:0;}',
+      '.trygc-ops-filter-label{display:block;font-size:10px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:rgb(161 161 170);line-height:1.3;}',
+      '.trygc-ops-filter-input{display:block;width:100%;min-width:0;min-height:46px;appearance:none;-webkit-appearance:none;border-radius:16px;border:1px solid rgba(17,24,39,.08);background:rgba(244,244,245,.92);padding:0 14px;color:rgb(24 24 27);font-size:14px;font-weight:600;line-height:1.35;outline:none;box-shadow:none;transition:border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease;}',
+      '.trygc-ops-filter-input::placeholder{color:rgb(113 113 122);opacity:1;}',
+      '.trygc-ops-filter-input:focus{border-color:rgba(var(--app-primary-rgb),.26);box-shadow:0 0 0 4px rgba(var(--app-primary-rgb),.08);background:rgba(255,255,255,.98);}',
+      '.trygc-ops-filter-input option{color:rgb(24 24 27);background:rgb(255 255 255);}',
+      '.dark .trygc-ops-filter-input{border-color:rgba(255,255,255,.08);background:rgba(39,39,42,.92);color:rgb(244 244 245);}',
+      '.dark .trygc-ops-filter-input::placeholder{color:rgb(161 161 170);}',
+      '.dark .trygc-ops-filter-input:focus{background:rgba(24,24,27,.98);}',
+      '.dark .trygc-ops-filter-input option{color:rgb(244 244 245);background:rgb(24 24 27);}',
       '.trygc-ops-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;}',
+      '.trygc-ops-stat-card{min-height:148px;background:linear-gradient(180deg, rgba(var(--app-primary-rgb),0.04), rgba(255,255,255,0) 68%);}',
+      '.dark .trygc-ops-stat-card{background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(24,24,27,0) 68%);}',
       '.trygc-ops-grid{display:grid;grid-template-columns:minmax(300px,340px) minmax(0,1fr);gap:16px;align-items:start;}',
+      '.trygc-ops-section{background:rgba(250,250,250,.94);}',
+      '.dark .trygc-ops-section{background:rgba(24,24,27,.94);}',
       '.trygc-ops-assignees{display:flex;flex-direction:column;gap:10px;}',
       '.trygc-ops-assignee{width:100%;text-align:left;cursor:pointer;}',
       '.trygc-ops-assignee:hover,.trygc-ops-task:hover{transform:translateY(-1px);}',
@@ -538,13 +1093,14 @@
       '.trygc-ops-tasks{display:flex;flex-direction:column;gap:12px;}',
       '.trygc-ops-task{width:100%;text-align:left;cursor:pointer;}',
       '.trygc-ops-task-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;}',
-      '.trygc-ops-widget{margin-top:14px;border-top:1px solid rgba(17,24,39,.08);padding-top:14px;}',
+      '.trygc-ops-widget{margin-top:16px;border-top:1px solid rgba(17,24,39,.08);padding-top:16px;}',
       '.dark .trygc-ops-widget{border-top-color:rgba(255,255,255,.08);}',
       '.trygc-ops-widget-head{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;}',
       '.trygc-ops-widget-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:12px;}',
+      '.trygc-ops-widget-stats > *{min-height:104px;padding:16px !important;}',
       '.trygc-ops-widget-users{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;}',
-      '@media (max-width: 980px){.trygc-ops-stats{grid-template-columns:repeat(2,minmax(0,1fr));}.trygc-ops-grid{grid-template-columns:minmax(0,1fr);}}',
-      '@media (max-width: 640px){.trygc-ops-stats,.trygc-ops-widget-stats{grid-template-columns:minmax(0,1fr);}.trygc-ops-head{gap:12px;}.trygc-ops-head-actions{width:100%;}.trygc-ops-head-actions button,.trygc-ops-widget-head button{flex:1 1 auto;justify-content:center;}.trygc-ops-button-label{white-space:normal;line-height:1.25;text-align:center;}}'
+      '@media (max-width: 980px){.trygc-ops-filter-grid,.trygc-ops-stats{grid-template-columns:repeat(2,minmax(0,1fr));}.trygc-ops-grid{grid-template-columns:minmax(0,1fr);}}',
+      '@media (max-width: 640px){.trygc-ops-shell::before{inset:-6% auto auto 42%;width:180px;height:180px;}.trygc-ops-filter-grid,.trygc-ops-stats,.trygc-ops-widget-stats{grid-template-columns:minmax(0,1fr);}.trygc-ops-head{gap:12px;}.trygc-ops-head-actions{width:100%;}.trygc-ops-head-actions button,.trygc-ops-widget-head button{flex:1 1 auto;justify-content:center;}.trygc-ops-button-label{white-space:normal;line-height:1.25;text-align:center;}}'
     ].join('');
     document.head.appendChild(style);
   }
@@ -560,21 +1116,146 @@
     });
   }
 
+  function ensureSummaryWidgetStyles() {
+    if (document.getElementById('trygc-summary-widget-styles')) return;
+    var style = document.createElement('style');
+    style.id = 'trygc-summary-widget-styles';
+    style.textContent = [
+      '[data-trygc-summary-card]{border:1px solid rgba(17,24,39,0.92) !important;}',
+      '[data-trygc-summary-card="in-progress"]{color:#111111 !important;}',
+      '[data-trygc-summary-card="in-progress"],[data-trygc-summary-card="in-progress"] *{color:#111111 !important;-webkit-text-fill-color:#111111 !important;opacity:1 !important;text-shadow:none !important;}',
+      '[data-trygc-summary-card="in-progress"] svg,[data-trygc-summary-card="in-progress"] svg *{stroke:#111111 !important;fill:#111111 !important;}',
+      '[data-trygc-summary-card="in-progress"] [fill="none"]{fill:none !important;}',
+      '[data-trygc-summary-card][data-trygc-summary-disabled="true"]{cursor:default !important;}'
+    ].join('');
+    document.head.appendChild(style);
+  }
+
+  function installSummaryWidgetInterceptor() {
+    if (summaryWidgetInterceptorInstalled) return;
+    summaryWidgetInterceptorInstalled = true;
+
+    document.addEventListener(
+      'click',
+      function (event) {
+        var card = event.target && event.target.closest ? event.target.closest('[data-trygc-summary-card]') : null;
+        if (!card) return;
+        event.preventDefault();
+        event.stopPropagation();
+      },
+      true
+    );
+
+    document.addEventListener(
+      'keydown',
+      function (event) {
+        var card = event.target && event.target.closest ? event.target.closest('[data-trygc-summary-card]') : null;
+        if (!card) return;
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        event.stopPropagation();
+      },
+      true
+    );
+  }
+
+  function patchSummaryWidgets() {
+    ensureSummaryWidgetStyles();
+    installSummaryWidgetInterceptor();
+    var config = [
+      {
+        key: 'total-tasks',
+        label: 'total tasks',
+        helper: 'done'
+      },
+      {
+        key: 'in-progress',
+        label: 'in progress',
+        helper: 'active now',
+        textTargets: ['in progress', 'active now']
+      },
+      {
+        key: 'overdue',
+        label: 'overdue',
+        helper: 'needs attention'
+      }
+    ];
+
+    var labelNodes = document.querySelectorAll('div,span,p,h1,h2,h3,h4');
+    config.forEach(function (entry) {
+      var labelNode = null;
+      var index;
+      for (index = 0; index < labelNodes.length; index += 1) {
+        var node = labelNodes[index];
+        if (!node || !node.textContent) continue;
+        if (normalizeText(node.textContent) !== entry.label) continue;
+        labelNode = node;
+        break;
+      }
+      if (!labelNode) return;
+
+      var card = labelNode.closest('button, a, .app-panel, article, section, [class*="rounded"]');
+      if (!card) return;
+
+      var cardText = normalizeText(card.textContent || '');
+      if (entry.helper && cardText.indexOf(entry.helper) === -1) return;
+
+      card.setAttribute('data-trygc-summary-card', entry.key);
+      card.setAttribute('data-trygc-summary-disabled', 'true');
+      card.style.borderColor = 'rgba(17,24,39,0.92)';
+      card.style.borderWidth = '1px';
+      card.style.borderStyle = 'solid';
+      card.style.cursor = 'default';
+      if (card.tagName === 'A') {
+        card.removeAttribute('href');
+      }
+      if (card.tagName === 'BUTTON') {
+        card.setAttribute('type', 'button');
+      }
+
+      if (entry.key === 'in-progress') {
+        var textNodes = card.querySelectorAll('div,span,p,svg');
+        textNodes.forEach(function (child) {
+          if (!child) return;
+          var childText = normalizeText(child.textContent || '');
+          if (
+            childText === entry.label ||
+            childText === entry.helper ||
+            /^\d+$/.test(String(child.textContent || '').trim())
+          ) {
+            child.style.color = '#111111';
+            child.style.setProperty('-webkit-text-fill-color', '#111111');
+            child.style.opacity = '1';
+          }
+        });
+      }
+    });
+  }
+
   function findLiveUsersWidget() {
+    if (opsPageState.widget && document.body && document.body.contains(opsPageState.widget)) {
+      return opsPageState.widget;
+    }
+
     var labels = document.querySelectorAll('h1,h2,h3,h4,p,span,div');
+    var markers = ['live users', 'active users', 'live active users'];
     var i;
     for (i = 0; i < labels.length; i += 1) {
       var node = labels[i];
       if (!node || !node.textContent) continue;
       if (node.closest('[data-trygc-ops-panel-shell],[data-trygc-ops-widget]')) continue;
-      var text = String(node.textContent || '').trim();
-      if (text !== 'Live Users' && text !== 'Active Users' && text !== 'Live Active Users') continue;
+      var text = String(node.textContent || '').trim().toLowerCase();
+      if (!markers.some(function (marker) { return text === marker; })) continue;
       var container = node.closest('.app-panel, .app-surface-card, article, section, [class*="rounded"]');
       if (!container) continue;
-      var containerText = String(container.textContent || '');
-      if (containerText.indexOf('online now') === -1 && containerText.indexOf('Connecting to presence') === -1 && containerText.indexOf('No other users online') === -1) {
+      var containerText = String(container.textContent || '').toLowerCase();
+      if (containerText.indexOf('online now') === -1 &&
+          containerText.indexOf('connecting to presence') === -1 &&
+          containerText.indexOf('no other users online') === -1 &&
+          containerText.indexOf('active now') === -1) {
         continue;
       }
+      container.setAttribute('data-trygc-ops-anchor', 'true');
       return container;
     }
     return null;
@@ -626,6 +1307,8 @@
     var container = findLiveUsersWidget();
     if (!container) {
       opsPageState.widget = null;
+      widgetSignature = '';
+      panelSignature = '';
       if (opsPageState.panel && opsPageState.panel.parentNode) {
         opsPageState.panel.hidden = true;
       }
@@ -646,7 +1329,8 @@
     }
 
     var previewUsers = liveUsers.slice(0, 4);
-    widget.innerHTML =
+    var snapshotLabel = formatSnapshotStamp(lastSnapshotStamp);
+    var markup =
       '<div class="trygc-ops-widget-head">' +
       '  <div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Live Ops</div>' +
       '  <button type="button" class="' + (opsPageState.open
@@ -658,11 +1342,25 @@
       '  <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 px-3 py-3"><div class="text-2xl font-black text-zinc-900 dark:text-zinc-100">' + tasks.length + '</div><div class="mt-1 text-[10px] font-black uppercase tracking-wider text-zinc-400">Assigned tasks</div></div>' +
       '  <div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 px-3 py-3"><div class="text-2xl font-black text-zinc-900 dark:text-zinc-100">' + assignees.length + '</div><div class="mt-1 text-[10px] font-black uppercase tracking-wider text-zinc-400">Owners</div></div>' +
       '</div>' +
+      '<div class="mt-3 text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Latest sync: ' + escapeHtml(snapshotLabel) + '</div>' +
       (previewUsers.length
         ? '<div class="trygc-ops-widget-users">' + previewUsers.map(function (user) {
-            return '<span class="inline-flex items-center gap-2 rounded-full bg-zinc-100 dark:bg-zinc-800 px-3 py-1.5 text-[11px] font-bold text-zinc-700 dark:text-zinc-300"><span class="trygc-ops-dot"></span>' + escapeHtml(user.name || user.email) + '</span>';
+            return '<span class="inline-flex items-center gap-2 rounded-full bg-zinc-100 dark:bg-zinc-800 px-3 py-1.5 text-[11px] font-bold text-zinc-700 dark:text-zinc-300"><span class="trygc-ops-dot"></span>' + escapeHtml(user.name || user.email) + (user.page ? '<span class="opacity-60">Â· ' + escapeHtml(normalizePath(user.page)) + '</span>' : '') + '</span>';
           }).join('') + '</div>'
         : '<div class="mt-3 text-xs font-medium text-zinc-500 dark:text-zinc-400">Presence updates will appear here as users refresh into the latest build.</div>');
+
+    var nextSignature = [
+      opsPageState.open ? '1' : '0',
+      tasks.length,
+      assignees.length,
+      snapshotLabel,
+      liveUsers.map(function (user) { return user.email + ':' + normalizePath(user.page); }).join('|')
+    ].join('::');
+
+    if (nextSignature !== widgetSignature || widget.innerHTML !== markup) {
+      widget.innerHTML = markup;
+      widgetSignature = nextSignature;
+    }
 
     widget.onclick = function (event) {
       var button = event.target && event.target.closest ? event.target.closest('[data-open-ops-panel="true"]') : null;
@@ -684,7 +1382,8 @@
     opsPageState.panel.hidden = false;
 
     var tasks = collectOpsTasks(latestWorkspaceSnapshot || {}, latestCommunitySnapshot || {});
-    var assignees = collectAssigneeStats(tasks);
+    var filteredTasks = filterOpsTasks(tasks);
+    var assignees = collectAssigneeStats(filteredTasks);
     var activeCount = liveUsers.length;
     var selectedAssignee = opsPageState.selectedAssignee;
 
@@ -695,43 +1394,53 @@
 
     var selectedGroup = assignees.find(function (item) { return item.key === selectedAssignee; }) || null;
     var selectedTasks = selectedGroup ? selectedGroup.tasks : [];
-    var totalAssigned = tasks.length;
+    var totalAssigned = filteredTasks.length;
     var peopleCount = assignees.length;
     var pathLabel = opsPageState.sourcePath === '/tasks-daily-routines'
       ? 'Tasks & Daily Routines'
       : opsPageState.sourcePath === '/tasks'
         ? 'All Tasks'
         : 'Dashboard';
-
-    opsPageState.host.innerHTML =
+    var snapshotLabel = formatSnapshotStamp(lastSnapshotStamp);
+    var normalizedStatusFilter = normalizeOpsFilter(opsPageState.statusFilter);
+    var normalizedSourceFilter = normalizeOpsFilter(opsPageState.sourceFilter);
+    var markup =
       '<div class="trygc-ops-shell app-panel rounded-[var(--app-card-radius)] border p-5 md:p-6">' +
       '  <div class="trygc-ops-wrap">' +
       '    <div class="trygc-ops-head">' +
       '      <div class="trygc-ops-head-copy">' +
-      '        <p class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Live Ops</p>' +
-      '        <h2 class="trygc-ops-title-text mt-2 text-xl md:text-2xl xl:text-3xl font-black leading-tight tracking-tight text-zinc-900 dark:text-zinc-100">Assigned work linked to the dashboard live-users widget.</h2>' +
-      '        <p class="trygc-ops-copy-text mt-2 text-sm font-medium leading-relaxed text-zinc-500 dark:text-zinc-400">This section sits inside the main build, directly under the existing Live Active Users card. Routes like ' + escapeHtml(pathLabel) + ' now deep-link here instead of opening a detached page.</p>' +
+      '        <p class="trygc-ops-kicker text-[10px] font-black uppercase tracking-widest text-zinc-400">Live Ops</p>' +
+      '        <h2 class="trygc-ops-title-text mt-2 font-black text-zinc-900 dark:text-zinc-100">Assigned work linked to the live users dashboard.</h2>' +
+      '        <p class="trygc-ops-copy-text mt-2 font-medium text-zinc-500 dark:text-zinc-400">Review assignments, filter by status or source, and inspect linked tasks without leaving ' + escapeHtml(pathLabel) + '.</p>' +
       '      </div>' +
       '      <div class="trygc-ops-head-actions">' +
       '        <button type="button" class="app-accent-button flex items-center gap-2 px-4 py-2.5 rounded-2xl font-black text-sm transition-all shadow-xl" data-ops-action="refresh"><span class="trygc-ops-button-label">Refresh Live Data</span></button>' +
       '        <button type="button" class="flex items-center gap-2 px-4 py-2.5 bg-zinc-100 dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 rounded-2xl font-black text-sm hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-all" data-ops-action="close"><span class="trygc-ops-button-label">Collapse</span></button>' +
       '      </div>' +
       '    </div>' +
-      '    <div class="trygc-ops-stats">' +
-      '      <div class="app-panel rounded-[var(--app-card-radius)] border p-5"><div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Live Active Users</div><div class="mt-3 text-3xl font-black tracking-tight text-zinc-900 dark:text-zinc-100">' + activeCount + '</div><div class="mt-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">Realtime presence across the tool</div></div>' +
-      '      <div class="app-panel rounded-[var(--app-card-radius)] border p-5"><div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Tasks Assigned To People</div><div class="mt-3 text-3xl font-black tracking-tight text-zinc-900 dark:text-zinc-100">' + totalAssigned + '</div><div class="mt-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">Excludes team or unassigned tasks</div></div>' +
-      '      <div class="app-panel rounded-[var(--app-card-radius)] border p-5"><div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">People With Assignments</div><div class="mt-3 text-3xl font-black tracking-tight text-zinc-900 dark:text-zinc-100">' + peopleCount + '</div><div class="mt-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">' + escapeHtml(selectedGroup ? selectedGroup.label + ' · ' + selectedGroup.count + ' tasks selected' : 'Choose an owner from the left rail') + '</div></div>' +
+      '    <div class="trygc-ops-section app-panel rounded-[var(--app-card-radius)] border p-4 md:p-5">' +
+      '      <div class="trygc-ops-filter-grid">' +
+      '        <label class="trygc-ops-filter-field"><span class="trygc-ops-filter-label">Search</span><input data-ops-input="search" value="' + escapeHtml(opsPageState.searchQuery) + '" class="trygc-ops-filter-input" type="text" placeholder="Search task, owner, status, or context" /></label>' +
+      '        <label class="trygc-ops-filter-field"><span class="trygc-ops-filter-label">Status</span><select data-ops-input="status" class="trygc-ops-filter-input"><option value="all"' + (normalizedStatusFilter === 'all' ? ' selected' : '') + '>All statuses</option><option value="pending"' + (normalizedStatusFilter === 'pending' ? ' selected' : '') + '>Pending</option><option value="in progress"' + (normalizedStatusFilter === 'in progress' ? ' selected' : '') + '>In progress</option><option value="blocked"' + (normalizedStatusFilter === 'blocked' ? ' selected' : '') + '>Blocked</option><option value="done"' + (normalizedStatusFilter === 'done' ? ' selected' : '') + '>Done</option></select></label>' +
+      '        <label class="trygc-ops-filter-field"><span class="trygc-ops-filter-label">Source</span><select data-ops-input="source" class="trygc-ops-filter-input"><option value="all"' + (normalizedSourceFilter === 'all' ? ' selected' : '') + '>All sources</option><option value="workspace"' + (normalizedSourceFilter === 'workspace' ? ' selected' : '') + '>Workspace</option><option value="campaign"' + (normalizedSourceFilter === 'campaign' ? ' selected' : '') + '>Campaign</option><option value="community"' + (normalizedSourceFilter === 'community' ? ' selected' : '') + '>Community</option><option value="standalone"' + (normalizedSourceFilter === 'standalone' ? ' selected' : '') + '>Standalone</option></select></label>' +
+      '      </div>' +
+      '      <div class="mt-3 flex flex-wrap items-center justify-between gap-3 text-[11px] font-medium text-zinc-500 dark:text-zinc-400"><span>Latest sync: ' + escapeHtml(snapshotLabel) + '</span><span>' + escapeHtml(String(totalAssigned)) + ' matching tasks across ' + escapeHtml(String(peopleCount)) + ' owners</span></div>' +
       '    </div>' +
-      '    <div class="app-panel rounded-[var(--app-card-radius)] border p-5">' +
+      '    <div class="trygc-ops-stats">' +
+      '      <div class="trygc-ops-stat-card app-panel rounded-[var(--app-card-radius)] border p-5"><div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Live Active Users</div><div class="mt-3 text-3xl font-black tracking-tight text-zinc-900 dark:text-zinc-100">' + activeCount + '</div><div class="mt-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">Realtime presence across the tool</div></div>' +
+      '      <div class="trygc-ops-stat-card app-panel rounded-[var(--app-card-radius)] border p-5"><div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Filtered Tasks</div><div class="mt-3 text-3xl font-black tracking-tight text-zinc-900 dark:text-zinc-100">' + totalAssigned + '</div><div class="mt-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">Person-only assignments after current filters are applied</div></div>' +
+      '      <div class="trygc-ops-stat-card app-panel rounded-[var(--app-card-radius)] border p-5"><div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">People With Assignments</div><div class="mt-3 text-3xl font-black tracking-tight text-zinc-900 dark:text-zinc-100">' + peopleCount + '</div><div class="mt-2 text-xs font-medium text-zinc-500 dark:text-zinc-400">' + escapeHtml(selectedGroup ? selectedGroup.label + ' Â· ' + selectedGroup.count + ' tasks selected' : 'Choose an owner from the left rail') + '</div></div>' +
+      '    </div>' +
+      '    <div class="trygc-ops-section app-panel rounded-[var(--app-card-radius)] border p-5">' +
       '      <div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Live Users</div>' +
       (liveUsers.length
         ? '<div class="trygc-ops-users">' + liveUsers.map(function (user) {
-            return '<span class="inline-flex items-center gap-2 rounded-full bg-zinc-100 dark:bg-zinc-800 px-3 py-1.5 text-xs font-bold text-zinc-700 dark:text-zinc-300"><span class="trygc-ops-dot"></span>' + escapeHtml(user.name || user.email) + '</span>';
+            return '<span class="inline-flex items-center gap-2 rounded-full bg-zinc-100 dark:bg-zinc-800 px-3 py-1.5 text-xs font-bold text-zinc-700 dark:text-zinc-300"><span class="trygc-ops-dot"></span>' + escapeHtml(user.name || user.email) + (user.page ? '<span class="opacity-60">Â· ' + escapeHtml(normalizePath(user.page)) + '</span>' : '') + '</span>';
           }).join('') + '</div>'
         : '<div class="mt-4 rounded-2xl border border-dashed border-zinc-200 dark:border-zinc-800 px-4 py-5 text-sm font-medium text-zinc-500 dark:text-zinc-400 text-center">No live users detected yet. A refresh after the new deploy will make active sessions appear here.</div>') +
       '    </div>' +
       '    <div class="trygc-ops-grid">' +
-      '      <div class="app-panel rounded-[var(--app-card-radius)] border p-5">' +
+      '      <div class="trygc-ops-section app-panel rounded-[var(--app-card-radius)] border p-5">' +
       '        <div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Assigned People</div>' +
       (assignees.length
         ? '<div class="trygc-ops-assignees">' + assignees.map(function (person) {
@@ -744,11 +1453,12 @@
           }).join('') + '</div>'
         : '<div class="mt-4 rounded-2xl border border-dashed border-zinc-200 dark:border-zinc-800 px-4 py-5 text-sm font-medium text-zinc-500 dark:text-zinc-400 text-center">No person-assigned tasks were found in the live workspace.</div>') +
       '      </div>' +
-      '      <div class="app-panel rounded-[var(--app-card-radius)] border p-5">' +
+      '      <div class="trygc-ops-section app-panel rounded-[var(--app-card-radius)] border p-5">' +
       '        <div class="text-[10px] font-black uppercase tracking-widest text-zinc-400">Clickable Tasks</div>' +
       (selectedTasks.length
         ? '<div class="trygc-ops-tasks">' + selectedTasks.map(function (task) {
             var isOpen = opsPageState.selectedTaskId === task.id;
+            var tone = statusTone(task.status);
             return '' +
               '<button type="button" class="trygc-ops-task rounded-2xl border px-4 py-4 transition-all ' + (isOpen
                 ? 'border-[rgba(var(--app-primary-rgb),0.12)] bg-zinc-50 dark:bg-zinc-900'
@@ -756,9 +1466,9 @@
               '  <div class="text-sm font-bold leading-6 text-zinc-800 dark:text-zinc-100">' + escapeHtml(task.title) + '</div>' +
               '  <div class="trygc-ops-task-meta">' +
               '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide">' + escapeHtml(task.contextLabel) + '</span>' +
-              '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide">' + escapeHtml(task.status) + '</span>' +
+              '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide" data-status-tone="' + escapeHtml(tone) + '">' + escapeHtml(task.status) + '</span>' +
               '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide">' + escapeHtml(task.priority) + '</span>' +
-              '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide">' + escapeHtml(task.sourceType) + '</span>' +
+              '    <span class="text-[10px] font-black px-2 py-1 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 uppercase tracking-wide">' + escapeHtml(sourceLabel(task.sourceType)) + '</span>' +
               '  </div>' +
               (isOpen ? '<div class="mt-3 border-t border-zinc-200 dark:border-zinc-800 pt-3 text-sm font-medium leading-relaxed text-zinc-500 dark:text-zinc-400">' + escapeHtml(task.description || 'No extra notes for this task yet.') + '</div>' : '') +
               '</button>';
@@ -768,6 +1478,11 @@
       '    </div>' +
       '  </div>' +
       '</div>';
+
+    if (markup !== panelSignature || opsPageState.host.innerHTML !== markup) {
+      opsPageState.host.innerHTML = markup;
+      panelSignature = markup;
+    }
 
     opsPageState.host.onclick = function (event) {
       var action = event.target && event.target.closest ? event.target.closest('[data-ops-action],[data-assignee-key],[data-task-id]') : null;
@@ -798,10 +1513,33 @@
         renderOpsPage();
       }
     };
+
+    opsPageState.host.oninput = function (event) {
+      var input = event.target && event.target.closest ? event.target.closest('[data-ops-input="search"]') : null;
+      if (!input) return;
+      opsPageState.searchQuery = input.value || '';
+      opsPageState.selectedTaskId = '';
+      renderOpsPage();
+    };
+
+    opsPageState.host.onchange = function (event) {
+      var input = event.target && event.target.closest ? event.target.closest('[data-ops-input]') : null;
+      if (!input) return;
+      if (input.getAttribute('data-ops-input') === 'status') {
+        opsPageState.statusFilter = input.value || 'all';
+      } else if (input.getAttribute('data-ops-input') === 'source') {
+        opsPageState.sourceFilter = input.value || 'all';
+      } else {
+        return;
+      }
+      opsPageState.selectedTaskId = '';
+      renderOpsPage();
+    };
   }
 
   function syncRouteView() {
     patchNavLabels();
+    patchSummaryWidgets();
     patchDashboardWidget();
 
     if (isOpsRoute(window.location.pathname)) {
@@ -824,6 +1562,7 @@
 
   function markAlert(id) {
     recentAlertIds.add(id);
+    trimSet(recentAlertIds, RECENT_ALERT_LIMIT);
     window.setTimeout(function () {
       recentAlertIds.delete(id);
     }, 45000);
@@ -879,12 +1618,14 @@
       .map(function (item) {
         var clone = Object.assign({}, item);
         clone.pinned = isPinnedUpdateNotification(item);
+        clone.read = !!item.read;
         return clone;
       })
       .sort(function (a, b) {
         var aPinned = a.pinned ? 1 : 0;
         var bPinned = b.pinned ? 1 : 0;
         if (aPinned !== bPinned) return bPinned - aPinned;
+        if (a.read !== b.read) return a.read ? 1 : -1;
         return notificationTimestamp(b) - notificationTimestamp(a);
       });
   }
@@ -947,19 +1688,24 @@
       var list = JSON.parse(raw);
       if (!Array.isArray(list)) return;
 
-      list.forEach(function (item) {
+      sortNotifications(list).slice(0, 24).forEach(function (item) {
         if (!item || item.id === undefined || item.id === null) return;
         var id = String(item.id);
         if (seenNotifIds.has(id)) return;
         seenNotifIds.add(id);
+        trimSet(seenNotifIds, SEEN_NOTIFICATION_LIMIT);
         if (item.read) return;
+        if (!isRelevantNotification(item)) return;
+        if (!shouldSurfaceNotification(item)) return;
 
-        var title = item.taskName || item.title || 'Assignment Update';
+        var campaign = item.taskName || item.title || 'Assignment Update';
+        var taskTitle = item.taskDescription || item.description || '';
         var assignee = item.assignedToName || item.assignedToEmail || item.assignedTo || '';
-        var detail = item.taskDescription || item.description || '';
-        var message = assignee
-          ? title + ' -> ' + assignee + (detail ? ' | ' + String(detail).substring(0, 90) : '')
-          : detail || title;
+        var message = taskTitle
+          ? taskTitle + (assignee ? ' -> ' + assignee : '') + ' â€¢ ' + campaign
+          : assignee
+            ? campaign + ' -> ' + assignee
+            : campaign;
         dispatchAlert('Assignment Update', message, 'notif:' + id);
       });
     } catch (err) {}
@@ -980,16 +1726,31 @@
   }
 
   function fetchJson(url) {
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timeoutId = controller
+      ? window.setTimeout(function () {
+          try {
+            controller.abort();
+          } catch (err) {}
+        }, FETCH_TIMEOUT_MS)
+      : null;
+
     return window.fetch(url, {
       method: 'GET',
+      cache: 'no-store',
+      signal: controller ? controller.signal : undefined,
       headers: {
         Authorization: 'Bearer ' + PUBLIC_ANON_KEY
       }
     }).then(function (response) {
+      if (timeoutId) window.clearTimeout(timeoutId);
       if (!response.ok) {
         throw new Error('Request failed: ' + response.status);
       }
       return response.json();
+    }).catch(function (error) {
+      if (timeoutId) window.clearTimeout(timeoutId);
+      throw error;
     });
   }
 
@@ -1007,16 +1768,20 @@
       })
     ])
       .then(function (results) {
-        var workspace = results[0] || {};
-        var community = results[1] || {};
+        var workspace = results[0] || latestWorkspaceSnapshot || {};
+        var community = results[1] || latestCommunitySnapshot || {};
         latestWorkspaceSnapshot = workspace;
         latestCommunitySnapshot = community;
+        lastSnapshotStamp = deriveSnapshotStamp(workspace, community);
+        writeSnapshotCache(workspace, community);
+        hydrateSaveFingerprintsFromSnapshots();
         notifyAssignmentChanges(collectAssignments(workspace, community));
         renderOpsPage();
       })
       .catch(function () {})
       .finally(function () {
         refreshInFlight = false;
+        scheduleSnapshotRefresh();
       });
   }
 
@@ -1101,11 +1866,14 @@
         }
       });
 
-      window.addEventListener('beforeunload', function () {
-        try {
-          channel.untrack().catch(function () {});
-        } catch (err) {}
-      });
+      if (!presenceUnloadBound) {
+        presenceUnloadBound = true;
+        window.addEventListener('beforeunload', function () {
+          try {
+            if (presenceChannel) presenceChannel.untrack().catch(function () {});
+          } catch (err) {}
+        });
+      }
     });
   }
 
@@ -1114,22 +1882,34 @@
 
     var originalFetch = window.fetch.bind(window);
     var wrapped = function (input, init) {
+      var url = typeof input === 'string' ? input : input && input.url ? input.url : '';
+      var method =
+        (init && init.method) ||
+        (typeof input !== 'string' && input && input.method) ||
+        'GET';
+      var normalizedMethod = String(method || 'GET').toUpperCase();
+      var isMutation = normalizedMethod !== 'GET';
+      var isPatchedApiCall = !!url && url.indexOf('/functions/v1/make-server-b626472b/') !== -1;
+      var isWorkspaceRequest = /\/workspace(?:\?|$)/.test(url);
+      var isCommunityRequest = /\/community-team-data(?:\?|$)/.test(url);
       var promise = originalFetch(input, init);
       promise
         .then(function (response) {
-          var url = typeof input === 'string' ? input : input && input.url ? input.url : '';
-          if (!response || !response.ok || !url) return;
-          if (url.indexOf('/functions/v1/make-server-b626472b/') === -1) return;
-
-          var method =
-            (init && init.method) ||
-            (typeof input !== 'string' && input && input.method) ||
-            'GET';
-
-          if (String(method).toUpperCase() === 'GET') return;
+          if (!url || !isPatchedApiCall || !isMutation) return;
+          if (!response || !response.ok) {
+            if (isWorkspaceRequest) scheduleWorkspacePersist(250);
+            if (isCommunityRequest) scheduleCommunityPersist(250);
+            return;
+          }
+          if (isWorkspaceRequest) markWorkspacePersisted();
+          if (isCommunityRequest) markCommunityPersisted();
           scheduleRefresh(250);
         })
-        .catch(function () {});
+        .catch(function () {
+          if (!url || !isPatchedApiCall || !isMutation) return;
+          if (isWorkspaceRequest) scheduleWorkspacePersist(250);
+          if (isCommunityRequest) scheduleCommunityPersist(250);
+        });
       return promise;
     };
 
@@ -1153,6 +1933,11 @@
       if (key === NOTIF_KEY) {
         normalizeStoredNotifications(originalSetItem);
         window.setTimeout(checkLocalNotifications, 60);
+      }
+      if (isWorkspaceStorageKey(key)) {
+        scheduleWorkspacePersist();
+      } else if (key === COMMUNITY_KEY) {
+        scheduleCommunityPersist();
       } else if (AUTH_KEYS.indexOf(key) >= 0) {
         window.setTimeout(startPresenceTracking, 120);
       }
@@ -1162,9 +1947,30 @@
       if (event.key === NOTIF_KEY) {
         normalizeStoredNotifications(originalSetItem);
         window.setTimeout(checkLocalNotifications, 60);
+      }
+      if (isWorkspaceStorageKey(event.key)) {
+        scheduleWorkspacePersist();
+      } else if (event.key === COMMUNITY_KEY) {
+        scheduleCommunityPersist();
       } else if (AUTH_KEYS.indexOf(event.key) >= 0) {
         window.setTimeout(startPresenceTracking, 120);
       }
+    });
+  }
+
+  function installRouteObserver() {
+    if (routeObserver || typeof MutationObserver !== 'function' || !document.body) return;
+
+    routeObserver = new MutationObserver(function (mutations) {
+      var changed = mutations.some(function (mutation) {
+        return mutation.addedNodes.length || mutation.removedNodes.length;
+      });
+      if (changed) scheduleRouteSync();
+    });
+
+    routeObserver.observe(document.body, {
+      childList: true,
+      subtree: true
     });
   }
 
@@ -1203,7 +2009,7 @@
           } catch (err) {}
         }
         var result = originalPushState.apply(this, arguments);
-        window.setTimeout(syncRouteView, 0);
+        scheduleRouteSync(0);
         return result;
       };
     }
@@ -1221,12 +2027,14 @@
           } catch (err) {}
         }
         var result = originalReplaceState.apply(this, arguments);
-        window.setTimeout(syncRouteView, 0);
+        scheduleRouteSync(0);
         return result;
       };
     }
 
-    window.addEventListener('popstate', syncRouteView, true);
+    window.addEventListener('popstate', function () {
+      scheduleRouteSync(0);
+    }, true);
     forceOpsDocumentNavigation();
   }
 
@@ -1241,15 +2049,35 @@
     installOpsLinkInterceptor();
     installOpsHistoryInterceptor();
     installFetchHook();
+    installRouteObserver();
     startPresenceTracking();
+    hydrateSnapshotsFromCache();
+    hydrateSaveFingerprintsFromSnapshots();
     syncRouteView();
+    renderOpsPage();
     refreshSnapshots();
+    scheduleWorkspacePersist(1800);
+    scheduleCommunityPersist(1800);
     if (rawLocalSetItem) normalizeStoredNotifications(rawLocalSetItem);
     checkLocalNotifications();
 
-    window.setInterval(refreshSnapshots, SNAPSHOT_POLL_MS);
     window.setInterval(checkLocalNotifications, 4000);
-    routeMonitorTimer = window.setInterval(syncRouteView, 700);
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') {
+        persistWorkspaceSnapshot(true);
+        persistCommunitySnapshot(true);
+      }
+      scheduleSnapshotRefresh(300);
+      scheduleRouteSync(60);
+    });
+    window.addEventListener(
+      'pagehide',
+      function () {
+        persistWorkspaceSnapshot(true);
+        persistCommunitySnapshot(true);
+      },
+      true
+    );
   }
 
   if (document.readyState === 'loading') {
